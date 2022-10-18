@@ -1,0 +1,3409 @@
+// ------------------------------------------------------------
+// -----                  R3BOnlineSpectra                -----
+// -----          Created April 13th 2016 by M.Heil       -----
+// ------------------------------------------------------------
+
+/*
+ * This task should fill histograms with detector variables which allow
+ * to test the detectors online
+ *
+ */
+
+#include "R3BLosCalData.h"
+#include "R3BLosMappedData.h"
+#include "R3BOnlineSpectra.h"
+
+#include "R3BSci8CalData.h"
+#include "R3BSci8MappedData.h"
+
+#include "R3BBeamMonitorMappedData.h"
+
+#include "R3BTofdCalData.h"
+#include "R3BTofdMappedData.h"
+
+#include "R3BPaddleCalData.h"
+#include "R3BPaddleTamexMappedData.h"
+
+#include "R3BPspxCalData.h"
+#include "R3BPspxHitData.h"
+#include "R3BPspxMappedData.h"
+#include "R3BPspxPrecalData.h"
+
+#include "R3BEventHeader.h"
+#include "R3BTCalEngine.h"
+#include "R3BTCalEngine.h"
+
+#include "R3BBunchedFiberCalData.h"
+#include "R3BBunchedFiberHitData.h"
+#include "R3BBunchedFiberMappedData.h"
+
+#include "R3BSfibMappedData.h"
+
+#include "FairLogger.h"
+#include "FairRootManager.h"
+#include "FairRunAna.h"
+#include "FairRunOnline.h"
+#include "FairRuntimeDb.h"
+#include "TCanvas.h"
+#include "TGaxis.h"
+#include "TH1F.h"
+#include "TH2F.h"
+#include "TF1.h"
+#include "THttpServer.h"
+
+#include "TClonesArray.h"
+#include "TMath.h"
+#include <TRandom3.h>
+#include <TRandomGen.h>
+#include <array>
+#include <cstdlib>
+#include <string>
+#include <ctime>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#define IS_NAN(x) TMath::IsNaN(x)
+using namespace std;
+
+R3BOnlineSpectra::R3BOnlineSpectra()
+    : R3BOnlineSpectra("OnlineSpectra", 1)
+{}
+
+R3BOnlineSpectra::R3BOnlineSpectra(const char* name, Int_t iVerbose)
+    : FairTask(name, iVerbose)
+    , fTrigger(-1)
+    , fTpat(-1)
+    , fNofPlanes(N_PLANE_MAX_TOFD)  
+    , fPaddlesPerPlane(N_PADDLE_MAX_TOFD) 
+    , fClockFreq(1. / VFTX_CLOCK_MHZ * 1000.)
+    , fNEvents(0)
+{
+}
+
+R3BOnlineSpectra::~R3BOnlineSpectra()
+{
+//	delete fhTpat ;
+//	delete fhTrigger;
+//	delete fh_SEETRAM;
+	
+   for(int i = 0; i < NOF_FIB_DET; i++) {	
+     delete fh_channels_Fib[i];
+     delete fh_fibers_Fib[i];
+     delete fh_mult_Fib[i];
+     delete fh_time_Fib[i];
+     delete fh_multihit_m_Fib[i];   
+     delete fh_multihit_s_Fib[i];
+     delete fh_ToT_m_Fib[i];
+     delete fh_ToT_s_Fib[i];
+   }
+}
+
+
+InitStatus R3BOnlineSpectra::Init()
+{
+
+	// Initialize random number:
+	std::srand(std::time(0)); //use current time as seed for random generator
+
+
+	LOG(INFO) << "R3BOnlineSpectra::Init " << FairLogger::endl;
+
+	// try to get a handle on the EventHeader. EventHeader may not be 
+	// present though and hence may be null. Take care when using.
+
+	FairRootManager* mgr = FairRootManager::Instance();
+	if (NULL == mgr)
+		LOG(fatal) << "FairRootManager not found";
+
+	header = (R3BEventHeader*)mgr->GetObject("R3BEventHeader");
+	FairRunOnline *run = FairRunOnline::Instance();
+
+	run->GetHttpServer()->Register("/Tasks", this);
+	
+/*
+// get access to BeamMonitor Mapped data
+    fbmonMappedItems = (TClonesArray*)mgr->GetObject("BeamMonitorMapped");  
+     if (NULL == fbmonMappedItems){
+      LOG(ERROR) << "Branch BeamMonitorMapped not found" << FairLogger::endl;
+      return kFATAL;
+     }
+*/    
+        // Get objects for detectors on all levels
+        assert(DET_MAX + 1 == sizeof(fDetectorNames)/sizeof(fDetectorNames[0]));
+        printf("Have %d fiber detectors.\n", NOF_FIB_DET);
+        for (int det = 0; det < DET_MAX; det++)
+        {
+                fMappedItems.push_back((TClonesArray *)mgr->GetObject(Form("%sMapped", fDetectorNames[det])));
+                if (NULL == fMappedItems.at(det)) {
+                  printf("Could not find mapped data for '%s'.\n", fDetectorNames[det]);
+                }
+                fCalItems.push_back((TClonesArray *)mgr->GetObject(Form("%sCal", fDetectorNames[det])));
+                fHitItems.push_back((TClonesArray *)mgr->GetObject(Form("%sHit", fDetectorNames[det])));
+        }
+
+
+	//------------------------------------------------------------------------ 
+	// create histograms of all detectors  
+	//------------------------------------------------------------------------ 
+
+
+
+	//------------------------------------------------------------------------ 
+	// Sci8 detector
+
+	if(fMappedItems.at(DET_SCI8)){
+		TCanvas *cSci8 = new TCanvas("Sci8", "SCI8", 10, 10, 850, 850);
+
+		fh_sci8_channels = new TH1F("sci8_channels", "SCI8 channels", 4, 0., 4.); 
+		fh_sci8_channels->GetXaxis()->SetTitle("Channel number");
+		fh_sci8_multihit = new TH1F("sci8_multihit", "SCI8 multihit",20, 0., 20.);
+		fh_sci8_multihit->GetXaxis()->SetTitle("Multihit");		
+		fh_sci8_multihitVFTX = new TH2F("sci8_vftx_multihit", "SCI8 VFTX multihit",4, 0., 4.,20, 0., 20.);
+		fh_sci8_multihitVFTX->GetYaxis()->SetTitle("Multihit ");
+		fh_sci8_multihitVFTX->GetXaxis()->SetTitle("Channel number");
+		fh_sci8_multihitLEAD = new TH2F("sci8_lead_multihit", "SCI8 TAMEX Leading multihit",4, 0., 4.,20, 0., 20.);
+		fh_sci8_multihitLEAD->GetYaxis()->SetTitle("Multihit ");
+		fh_sci8_multihitLEAD->GetXaxis()->SetTitle("Channel number");
+		fh_sci8_multihitTRAI = new TH2F("sci8_trai_multihit", "SCI8 TAMEX Trailing multihit",4, 0., 4.,20, 0., 20.);
+		fh_sci8_multihitTRAI->GetYaxis()->SetTitle("Multihit ");		
+		fh_sci8_multihitTRAI->GetXaxis()->SetTitle("Channel number");
+		fh_sci8_dt_hits = new TH1F("sci8_dt_hits", "SCI8 dt multihits",40000,-2000,2000);
+		fh_sci8_dt_hits->GetXaxis()->SetTitle("dt_VFTX between two hits / ns");
+		fh_sci8_dt_hits_l = new TH1F("sci8_dt_hits_l", "SCI8 dt multihits leading",40000,-2000,2000);
+		fh_sci8_dt_hits_l->GetXaxis()->SetTitle("dt_LEAD between two hits / ns");
+		fh_sci8_dt_hits_t = new TH1F("sci8_dt_hits_t", "SCI8 dt multihits trailing",40000,-2000,2000);
+		fh_sci8_dt_hits_t->GetXaxis()->SetTitle("dt_TRAIL between two hits / ns");
+		fh_sci8_tres_MCFD = new TH1F("sci8_time_res_MCFD", "SCI8 MCFD Time resolution - raw", 30000, 0., 300.);
+		fh_sci8_tres_MCFD->GetXaxis()->SetTitle("Time MCFD / ns");
+		fh_sci8_tres_TAMEX = new TH1F("sci8_time_res_TAMEX", "SCI8 TAMEX Time resolution -raw ", 8000, -4., 4.);  
+		fh_sci8_tres_TAMEX->GetXaxis()->SetTitle("Time TAMEX / ns"); 
+		fh_sci8_tot = new TH2F("sci8_tot","SCI8 ToT vs PM",4,0,4,3000,0.,300.); 
+		fh_sci8_tot->GetXaxis()->SetTitle("PMT number");
+		fh_sci8_tot->GetYaxis()->SetTitle("ToT / ns");
+		fh_sci8_tot_mean = new TH1F("sci8_tot_mean","SCI8 mean ToT",30000,0.,300.); 
+		fh_sci8_tot_mean->GetYaxis()->SetTitle("Counts");
+		fh_sci8_tot_mean->GetXaxis()->SetTitle("ToT / ns");
+		fh_tof_sci8 = new TH1F("sci8_tof", "SCI8-LOS ToF",40000,-20,20);
+		fh_tof_sci8->GetXaxis()->SetTitle("ToF / ns");
+
+
+		cSci8->Divide(3, 3);
+		cSci8->cd(1);
+		fh_sci8_channels->Draw();		
+		cSci8->cd(2);gPad->SetLogy();
+		fh_sci8_multihit->Draw();
+		cSci8->cd(3);gPad->SetLogz();
+		fh_sci8_tot->Draw("colz");	
+		cSci8->cd(4);
+		fh_sci8_tres_MCFD->Draw();
+		cSci8->cd(5);
+		fh_sci8_tres_TAMEX->Draw();
+		cSci8->cd(6);
+		fh_tof_sci8->Draw();		
+		cSci8->cd(7);
+		fh_sci8_tot_mean->Draw();
+
+		cSci8->cd(0);
+		run->AddObject(cSci8);
+
+		run->GetHttpServer()->RegisterCommand("Reset_SCI8", Form("/Tasks/%s/->Reset_SCI8_Histo()", GetName()));
+ 
+	}	
+
+	if(fMappedItems.at(DET_BMON)){		
+		fhTpat = new TH1F("Tpat", "Tpat", 20, 0, 20);
+        fhTpat->GetXaxis()->SetTitle("Tpat value");
+        fhTrigger = new TH1F("Trigger", "Trigger all", 20, 0, 20);
+        fhTrigger->GetXaxis()->SetTitle("Trigger value");
+        
+        fh_SEETRAM = new TH2F("SEE", "SEE",7200,0,3600,15000,0,150000);
+        fh_SEETRAM->GetXaxis()->SetTitle("time / sec");
+        fh_SEETRAM->GetYaxis()->SetTitle("SEETRAM counts");
+        
+        fh_IC = new TH2F("IC", "IC",7200,0,3600,15000,0,150000);
+        fh_IC->GetXaxis()->SetTitle("time / sec");
+        fh_IC->GetYaxis()->SetTitle("IC counts");
+        
+        fh_TOFDOR = new TH2F("TOFDOR", "TOFDOR",7200,0,3600,15000,0,150000);
+        fh_TOFDOR->GetXaxis()->SetTitle("time / sec");
+        fh_TOFDOR->GetYaxis()->SetTitle("TOFDOR counts");
+        
+		TCanvas *cbmon = new TCanvas("Beam_Monitor", "Beam Monitors", 820, 10, 700, 800);
+		cbmon->Divide(3,2);	
+		cbmon->cd(1);gPad->SetLogy();
+		fhTrigger->Draw();
+		cbmon->cd(2);gPad->SetLogy();
+		fhTpat->Draw();
+		cbmon->cd(4);gPad->SetLogz();
+		fh_SEETRAM ->Draw("colz");
+		cbmon->cd(5);gPad->SetLogz();
+		fh_IC->Draw("colz");
+		cbmon->cd(6);gPad->SetLogz();
+		fh_TOFDOR->Draw("colz");	
+		cbmon->cd(0);
+		run->AddObject(cbmon);
+		
+		run->GetHttpServer()->RegisterCommand("Reset_BMON", Form("/Tasks/%s/->Reset_BMON_Histo()", GetName()));
+}
+
+
+	//------------------------------------------------------------------------ 
+	// Los detector
+
+	if(fMappedItems.at(DET_LOS)){
+		TCanvas *cLos = new TCanvas("Los", "LOS", 10, 10, 910, 810);
+
+		fh_los_channels = new TH1F("los_channels", "LOS channels", 10, 0., 10.); 
+		fh_los_channels->GetXaxis()->SetTitle("Channel number");
+		fh_los_multihit = new TH1F("los_multihit", "LOS multihit && all 8 PMs",10, 0., 10.);
+		fh_los_multihit->GetXaxis()->SetTitle("Multihit");	       	
+        fh_los_pos_MCFD = new TH2F("los_pos_MCFD", "LOS MCFD Position ", 1000, -5., 5.,1000, -5., 5.);
+		fh_los_pos_MCFD->GetXaxis()->SetTitle("X position / cm");
+		fh_los_pos_MCFD->GetYaxis()->SetTitle("Y position / cm"); 
+		fh_los_pos_TAMEX = new TH2F("los_pos_TAMEX", "LOS TAMEX Position ", 1000, -5., 5.,1000, -5., 5.);
+		fh_los_pos_TAMEX->GetXaxis()->SetTitle("X position / cm");
+		fh_los_pos_TAMEX->GetYaxis()->SetTitle("Y position / cm"); 
+        fh_los_pos_ToT = new TH2F("los_pos_ToT", "LOS ToT Position ", 1000, -5., 5.,1000, -5., 5.);
+		fh_los_pos_ToT->GetXaxis()->SetTitle("X position / cm");
+		fh_los_pos_ToT->GetYaxis()->SetTitle("Y position / cm");
+		fh_los_dt_hits_ToT= new TH2F("los_dt_ToT", "LOS ToT dt ",5000,0,3000,500,0,200.); 
+		fh_los_dt_hits_ToT->GetXaxis()->SetTitle("dt between two hits / ns");
+		fh_los_dt_hits_ToT->GetYaxis()->SetTitle("ToT / ns");
+		fh_los_dt_first_ToT= new TH2F("los_dt_events_ToT", "LOS ToT dtevents ",5000,0,150000,500,0,200.); 
+		fh_los_dt_first_ToT->GetXaxis()->SetTitle("dt between two events / ns");
+		fh_los_dt_first_ToT->GetYaxis()->SetTitle("ToT / ns");
+		
+		fh_los_tres_MCFD = new TH1F("los_time_res_MCFD", "LOS MCFD Time resolution - raw", 4000, -4., 4.);
+		fh_los_tres_MCFD->GetXaxis()->SetTitle("Time MCFD / ns");
+		fh_los_tres_TAMEX = new TH1F("los_time_res_TAMEX", "LOS TAMEX Time resolution -raw ", 4000, -4., 4.);  
+		fh_los_tres_TAMEX->GetXaxis()->SetTitle("Time TAMEX / ns"); 
+		fh_los_tot = new TH2F("los_tot","LOS ToT vs PM",10,0,10,3100,-10.,300.); 
+		fh_los_tot->GetXaxis()->SetTitle("PMT number");
+		fh_los_tot->GetYaxis()->SetTitle("ToT / ns");
+		fh_los_tot_mean = new TH1F("los_tot_mean","LOS mean ToT",1500,0.,300.); 
+		fh_los_tot_mean->GetYaxis()->SetTitle("Counts");
+		fh_los_tot_mean->GetXaxis()->SetTitle("ToT / ns");
+        fh_los_ihit_ToT= new TH2F("los_tot_ihit","LOS ToT vs ihit",10,0,10,3100,-10.,300.);
+        fh_los_ihit_ToT ->GetXaxis()->SetTitle("iHit");
+        fh_los_ihit_ToT ->GetYaxis()->SetTitle("ToT / ns");
+        
+
+
+		cLos->Divide(4,3);
+		cLos->cd(1);
+		fh_los_channels->Draw();		
+		cLos->cd(2);gPad->SetLogy();
+		fh_los_multihit->Draw();
+		cLos->cd(3);gPad->SetLogz();
+		fh_los_tot->Draw("colz");      
+		cLos->cd(4);gPad->SetLogy();
+		fh_los_tot_mean->Draw();
+		cLos->cd(5);gPad->SetLogz();
+		fh_los_ihit_ToT	->Draw("colz");
+		cLos->cd(6);gPad->SetLogz();
+		fh_los_dt_first_ToT->Draw("colz");
+		cLos->cd(7);gPad->SetLogz();
+		fh_los_dt_hits_ToT->Draw("colz");			
+		cLos->cd(8);gPad->SetLogy();
+		fh_los_tres_MCFD->Draw();
+		cLos->cd(9);gPad->SetLogy();
+		fh_los_tres_TAMEX->Draw();
+		cLos->cd(10);gPad->SetLogz();
+		fh_los_pos_ToT->Draw("colz");
+		cLos->cd(11);gPad->SetLogz();
+		fh_los_pos_MCFD->Draw("colz");
+		cLos->cd(12);gPad->SetLogz();
+		fh_los_pos_TAMEX->Draw("colz");		
+		cLos->cd(0);
+		run->AddObject(cLos);
+
+		run->GetHttpServer()->RegisterCommand("Reset_LOS", Form("/Tasks/%s/->Reset_LOS_Histo()", GetName()));
+	}
+
+	//
+	//-----------------------------------------------------------------------
+	// Fiber Detectors 1-NOF_FIB_DET
+
+	char canvName[255];
+	TCanvas *FibCanvas[NOF_FIB_DET];
+
+	for(Int_t ifibcount = 0; ifibcount < NOF_FIB_DET; ifibcount++){
+
+		std::stringstream fibhitobj;
+		std::stringstream fibmapobj;
+		std::stringstream FiName;   
+		std::string temp;	  
+
+		std::stringstream histName1,histName2,histName3,histName4,histName5,histName6,
+                  histName7,histName8,histName9,histName10,histName11,histName12,histName13;
+		std::stringstream histTitle1,histTitle2,histTitle3,histTitle4,histTitle5,histTitle6,
+                  histTitle7,histTitle8,histTitle9,histTitle10,histTitle11,histTitle12,histTitle13;	   	    	 
+
+		if(fMappedItems.at(DET_FI_FIRST + ifibcount)) {
+
+			const char* chistName;
+			const char* chistTitle;
+                        const char* detName;
+			std::string tempTitle;
+			std::string tempName;
+			std::stringstream tempFibName;
+			std::string tempFibNames;
+			std::stringstream tempCanvName;
+
+                        detName = fDetectorNames[DET_FI_FIRST + ifibcount];
+
+			cout << "I am creating canvas " << detName <<endl;
+
+			FibCanvas[ifibcount]=new TCanvas(detName, detName, 10, 10, 910, 910);
+			
+			// Channels:   
+			histName1 << detName << "_channels";
+			tempName=histName1.str();
+			chistName=tempName.c_str();
+			histTitle1 << detName << " channels";
+			tempTitle=histTitle1.str();
+			chistTitle=tempTitle.c_str();
+			fh_channels_Fib[ifibcount] = new TH1F(chistName, chistTitle, 520, 0., 520.);
+			fh_channels_Fib[ifibcount]->GetXaxis()->SetTitle("Channel number");
+			fh_channels_Fib[ifibcount]->GetYaxis()->SetTitle("Counts");
+			tempName.clear();
+			tempTitle.clear();      
+			// Fibers:
+			histName2 << detName << "_fibers";
+			tempName=histName2.str();
+			chistName=tempName.c_str();
+			histTitle2 << detName << " fibers";
+			tempTitle=histTitle2.str();
+			chistTitle=tempTitle.c_str();
+			fh_fibers_Fib[ifibcount] = new TH1F(chistName, chistTitle, 2100, 0., 2100.); 
+			fh_fibers_Fib[ifibcount]->GetXaxis()->SetTitle("Fiber number");
+			fh_fibers_Fib[ifibcount]->GetYaxis()->SetTitle("Counts");
+			tempName.clear();
+			tempTitle.clear();
+			// Multiplicity (number of hit fibers):
+			histName3 << detName << "_mult";
+			tempName=histName3.str();
+			chistName=tempName.c_str();
+			histTitle3 << detName << " # of hit fibers ";
+			tempTitle=histTitle3.str();
+			chistTitle=tempTitle.c_str();
+			fh_mult_Fib[ifibcount] = new TH1F(chistName, chistTitle, 100, 0., 100.);	   
+			fh_mult_Fib[ifibcount]->GetXaxis()->SetTitle("Multiplicity");
+			fh_mult_Fib[ifibcount]->GetYaxis()->SetTitle("Counts");
+			tempName.clear();
+			tempTitle.clear();   
+			// Multihit MAPMT:
+			histName5 << detName << "_multihit_m";
+			tempName=histName5.str();
+			chistName=tempName.c_str();
+			histTitle5 << detName << " multihits MAPMT";
+			tempTitle=histTitle5.str();
+			chistTitle=tempTitle.c_str();   
+			fh_multihit_m_Fib[ifibcount] = new TH2F(chistName, chistTitle, 520, 0., 520., 20, 0., 20.);
+			fh_multihit_m_Fib[ifibcount]->GetXaxis()->SetTitle("MAPMT channel");
+			fh_multihit_m_Fib[ifibcount]->GetYaxis()->SetTitle("Multihit");
+			tempName.clear();
+			tempTitle.clear();	   
+			// Multihit SAPMT:
+			histName6 << detName << "_multihit_s";
+			tempName=histName6.str();
+			chistName=tempName.c_str();
+			histTitle6 << detName << " multihits SAPMT";
+			tempTitle=histTitle6.str();
+			chistTitle=tempTitle.c_str();	   
+			fh_multihit_s_Fib[ifibcount] = new TH2F(chistName, chistTitle, 16, 0., 16., 20, 0., 20.);   	   
+			fh_multihit_s_Fib[ifibcount]->GetXaxis()->SetTitle("SAPMT channel");
+			fh_multihit_s_Fib[ifibcount]->GetYaxis()->SetTitle("Multihit");
+			tempName.clear();
+			tempTitle.clear(); 
+			// ToT MAPMT:  
+			histName7 << detName << "_tot_m";
+			tempName=histName7.str();
+			chistName=tempName.c_str();
+			histTitle7 << detName << " ToT of MAPMT";
+			tempTitle=histTitle7.str();
+			chistTitle=tempTitle.c_str();	   
+			fh_ToT_m_Fib[ifibcount] = new TH2F(chistName, chistTitle, 2100, 0., 2100., 400, 0., 200.);   	   
+			fh_ToT_m_Fib[ifibcount]->GetXaxis()->SetTitle("Fiber number");
+			fh_ToT_m_Fib[ifibcount]->GetYaxis()->SetTitle("ToT / ns");
+			tempName.clear();
+			tempTitle.clear();
+			// ToT SAPMT:  
+			histName8 << detName << "_tot_s";
+			tempName=histName8.str();
+			chistName=tempName.c_str();
+			histTitle8 << detName << " ToT of SAPMT";
+			tempTitle=histTitle8.str();
+			chistTitle=tempTitle.c_str();	   
+			fh_ToT_s_Fib[ifibcount] = new TH2F(chistName, chistTitle, 2100, 0., 2100., 400, 0., 200.);   	   
+			fh_ToT_s_Fib[ifibcount]->GetXaxis()->SetTitle("Fiber number");
+			fh_ToT_s_Fib[ifibcount]->GetYaxis()->SetTitle("ToT / ns");
+			tempName.clear();
+			tempTitle.clear();	   
+			// Time of fiber: 
+			histName9 << detName << "_TimevsFiber";
+			tempName=histName9.str();
+			chistName=tempName.c_str();
+			histTitle9 << detName << " Time vs Fiber";
+			tempTitle=histTitle9.str();
+			chistTitle=tempTitle.c_str();
+			fh_time_Fib[ifibcount]= new TH2F(chistName, chistTitle, 2100, 0., 2100., 20000, -1024., 1024.);
+			fh_time_Fib[ifibcount]->GetXaxis()->SetTitle("Fiber number");
+			fh_time_Fib[ifibcount]->GetYaxis()->SetTitle("tMAPMT-tSPMT");
+			tempName.clear();
+			tempTitle.clear();
+			// ToF LOS -> Fiber:
+			histName11 << detName << "_tof";
+			tempName=histName11.str();
+			chistName=tempName.c_str();
+			histTitle11 << detName << " ToF LOS to Fiber ";
+			tempTitle=histTitle11.str();
+			chistTitle=tempTitle.c_str();
+			fh_Fib_ToF[ifibcount] = new TH2F(chistName, chistTitle, 2100, 0., 2100.,10000, -5000., 5000.);	   
+			fh_Fib_ToF[ifibcount]->GetYaxis()->SetTitle("ToF / ns");
+			fh_Fib_ToF[ifibcount]->GetXaxis()->SetTitle("Fiber number");
+			tempName.clear();
+			tempTitle.clear();         
+			// Not-calibrated position:
+			histName12 << detName << "_pos";
+			tempName=histName12.str();
+			chistName=tempName.c_str();
+			histTitle12 << detName << " Not-calibrated position ";
+			tempTitle=histTitle12.str();
+			chistTitle=tempTitle.c_str();
+			fh_Fib_pos[ifibcount] = new TH1F(chistName, chistTitle, 6000, -1500., 1500.);	   
+			fh_Fib_pos[ifibcount]->GetXaxis()->SetTitle("Position");
+			fh_Fib_pos[ifibcount]->GetYaxis()->SetTitle("Counts");
+			tempName.clear();
+			tempTitle.clear();
+			// hit fiber number vs. event number:
+			histName13 << detName << "_fib_vs_event";
+			tempName=histName13.str();
+			chistName=tempName.c_str();
+			histTitle13 << detName << " Fiber # vs. Event # ";
+			tempTitle=histTitle13.str();
+			chistTitle=tempTitle.c_str();
+			fh_Fib_vs_Events[ifibcount] = new TH2F(chistName, chistTitle, 10000,0,5e6,1100, 0., 1100.);	   
+			fh_Fib_vs_Events[ifibcount]->GetYaxis()->SetTitle("Fiber number");
+			fh_Fib_vs_Events[ifibcount]->GetXaxis()->SetTitle("Event number");
+			tempName.clear();
+			tempTitle.clear();         
+
+			FibCanvas[ifibcount]->Divide(3, 4);
+			FibCanvas[ifibcount]->cd(1);
+			fh_channels_Fib[ifibcount]->Draw();
+			FibCanvas[ifibcount]->cd(2);gPad->SetLogz();
+			fh_multihit_m_Fib[ifibcount]->Draw("colz"); 
+			FibCanvas[ifibcount]->cd(3);gPad->SetLogz();
+			fh_multihit_s_Fib[ifibcount]->Draw("colz");      
+			FibCanvas[ifibcount]->cd(4);
+			fh_fibers_Fib[ifibcount]->Draw();
+			FibCanvas[ifibcount]->cd(5);
+			fh_mult_Fib[ifibcount]->Draw();      
+			FibCanvas[ifibcount]->cd(6);gPad->SetLogz();
+			fh_ToT_m_Fib[ifibcount]->Draw("colz");
+			FibCanvas[ifibcount]->cd(7);gPad->SetLogz();
+			fh_ToT_s_Fib[ifibcount]->Draw("colz");
+			//FibCanvas[ifibcount]->cd(8);gPad->SetLogz();
+			//fh_time_Fib[ifibcount]->Draw("colz");        
+			FibCanvas[ifibcount]->cd(8);gPad->SetLogz();
+			fh_Fib_ToF[ifibcount]->Draw("colz");
+			FibCanvas[ifibcount]->cd(9);
+			fh_Fib_pos[ifibcount]->Draw();
+			FibCanvas[ifibcount]->cd(10);
+			fh_Fib_vs_Events[ifibcount]->Draw("colz");        
+
+			FibCanvas[ifibcount]->cd(0);
+			run->AddObject(FibCanvas[ifibcount]);     
+
+
+		}	// end if(Mapped)
+		
+	}  // end for(ifibcount)
+	if(NOF_FIB_DET>0) run->GetHttpServer()->RegisterCommand("Reset_Fibers", Form("/Tasks/%s/->Reset_FIBERS_Histo()", GetName()));
+
+
+
+	//---------------------------------------------------------------------------------------
+	//Ptof detector
+
+	if(fCalItems.at(DET_PTOF)){
+
+		TCanvas *cPtof_plane = new TCanvas("Ptof_plane", "Ptof plane", 10, 10, 510, 510);
+		cPtof_plane->Divide(1, 2);
+
+		fh_ptof_channels = new TH1F("Ptof_channels", "Ptof channels", 65, 0., 65.);
+		cPtof_plane->cd(1);
+		fh_ptof_channels->Draw();
+
+		fh_ptof_channels_cut = new TH1F("Ptof_channels_cut", "Ptof channels with cut", 65, 0., 65.);
+		cPtof_plane->cd(2);
+		fh_ptof_channels_cut->Draw();
+		run->AddObject(cPtof_plane);
+
+		TCanvas *cPtof_test = new TCanvas("Ptof_test", "Ptof test", 10, 10, 510, 510);
+		cPtof_test->Divide(1, 1);
+
+		fh_ptof_test1 = new TH1F("Ptof_test1", "Ptof test1", 1000, 0., 100.);
+		fh_ptof_test2 = new TH1F("Ptof_test2", "Ptof test2", 1000, 0., 100.);
+		cPtof_test->cd(1);
+		fh_ptof_test1->Draw();
+		//		cPtof_test->cd(2);
+		//		fh_ptof_test2->Draw();
+
+		run->AddObject(cPtof_test);
+
+		TCanvas* cPtof1;
+		cPtof1 = new TCanvas("Ptof1", "Ptof1", 10, 10, 500, 500);
+		cPtof1->Divide(3,3);
+		for (Int_t j = 1; j < 10; j++){
+			char strName[255];
+			sprintf(strName, "ToT_Bar_%d_PM_1", j);
+			fh_ptof_TotPm1[j] = new TH1F(strName, "", 1000, 0., 100.);
+			cPtof1->cd(j);
+			fh_ptof_TotPm1[j]->Draw();           
+		}
+		run->AddObject(cPtof1);
+
+		TCanvas* cPtof2;
+		cPtof2 = new TCanvas("Ptof2", "Ptof2", 10, 10, 500, 500);
+		cPtof2->Divide(3,3);
+		for (Int_t j = 1; j < 10; j++){
+			char strName[255];
+			sprintf(strName, "ToT_Bar_%d_PM_2", j);
+			fh_ptof_TotPm2[j] = new TH1F(strName, "", 1000, 0., 100.);
+			cPtof2->cd(j);
+			fh_ptof_TotPm2[j]->Draw();           
+		}
+		run->AddObject(cPtof2);
+	}
+
+
+	//---------------------------------------------------------------------------------------------------
+	//TofD detector
+
+	if(fMappedItems.at(DET_TOFD)){
+		TCanvas *cTofd_planes = new TCanvas("TOFD_planes", "TOFD planes", 10, 10, 1100, 1000);
+		cTofd_planes->Divide(5, 4);
+
+		for (Int_t j = 0; j < 4; j++)
+		{
+			char strName1[255];
+			sprintf(strName1, "tofd_channels_plane_%d", j+1);
+			char strName2[255];
+			sprintf(strName2, "Tofd channels plane %d", j+1);        
+			fh_tofd_channels[j] = new TH1F(strName1, strName2, 90, -45., 45.);		 
+			fh_tofd_channels[j]->GetXaxis()->SetTitle("Channel");
+			fh_tofd_channels[j]->GetYaxis()->SetTitle("Counts");
+
+			char strName3[255];
+			sprintf(strName3, "tofd_ToT_plane_%d", j+1);
+			char strName4[255];
+			sprintf(strName4, "Tofd ToT plane %d", j+1);        
+			fh_tofd_TotPm[j] = new TH2F(strName3, strName4, 90,-45,45,30000,0.,300.);
+			fh_tofd_TotPm[j]->GetXaxis()->SetTitle("Bar number");
+			fh_tofd_TotPm[j]->GetYaxis()->SetTitle("ToT / ns");
+
+			char strName7[255];
+			sprintf(strName7, "tofd_ToF_plane_%d", j+1);
+			char strName8[255];
+			sprintf(strName8, "TOFD-LOS ToF plane %d", j+1); 
+			fh_tofd_ToF[j] = new TH2F(strName7, strName8, 15,0,15, 1e4, 0, 1e2);
+			fh_tofd_ToF[j]->GetXaxis()->SetTitle("Bar number");
+			fh_tofd_ToF[j]->GetYaxis()->SetTitle("ToF / ns");
+
+			char strName9[255];
+			sprintf(strName9, "tofd_multihit_plane_%d", j+1);
+			char strName10[255];
+			sprintf(strName10, "Tofd multihit plane %d", j+1);        
+			fh_tofd_multihit[j] = new TH2F(strName9, strName10, 45, 0., 45., 10, 0, 10);		 
+			fh_tofd_multihit[j]->GetXaxis()->SetTitle("Bar number");
+			fh_tofd_multihit[j]->GetYaxis()->SetTitle("Multihit");
+
+			if(j<3)
+			{
+				int jk = j + 1;
+				char strName5[255];
+				sprintf(strName5, "tofd_ToF_plane_%d_%d", jk, jk+1);
+				char strName6[255];
+				sprintf(strName6, "Tofd ToF plane %d and %d ", jk, jk+1); 
+				fh_tofd_dt[j] = new TH2F(strName5, strName6, 50,0,50,8000, -40., 40);
+				fh_tofd_dt[j]->GetXaxis()->SetTitle("Bar number");
+				fh_tofd_dt[j]->GetYaxis()->SetTitle("dt / ns");
+			}
+		}
+
+
+		cTofd_planes->cd(1);
+		fh_tofd_channels[0]->Draw();
+		cTofd_planes->cd(2);gPad->SetLogz();
+		fh_tofd_TotPm[0]->Draw("colz");
+		cTofd_planes->cd(3);gPad->SetLogz();
+		fh_tofd_ToF[0]->Draw("colz");
+		cTofd_planes->cd(4);gPad->SetLogz();
+		fh_tofd_multihit[0]->Draw("colz");
+
+		cTofd_planes->cd(6);
+		fh_tofd_channels[1]->Draw();
+		cTofd_planes->cd(7);gPad->SetLogz();
+		fh_tofd_TotPm[1]->Draw("colz");
+		cTofd_planes->cd(8);gPad->SetLogz();
+		fh_tofd_ToF[1]->Draw("colz");
+		cTofd_planes->cd(9);gPad->SetLogz();
+		fh_tofd_multihit[1]->Draw("colz");
+		cTofd_planes->cd(10);gPad->SetLogz();
+		fh_tofd_dt[0]->Draw("colz");
+
+		cTofd_planes->cd(11);
+		fh_tofd_channels[2]->Draw();
+		cTofd_planes->cd(12);gPad->SetLogz();
+		fh_tofd_TotPm[2]->Draw("colz");	 
+		cTofd_planes->cd(13);gPad->SetLogz();
+		fh_tofd_ToF[2]->Draw("colz");
+		cTofd_planes->cd(14);gPad->SetLogz();
+		fh_tofd_multihit[2]->Draw("colz");
+		cTofd_planes->cd(15);gPad->SetLogz();
+		fh_tofd_dt[1]->Draw("colz");
+
+		cTofd_planes->cd(16);
+		fh_tofd_channels[3]->Draw();
+		cTofd_planes->cd(17);gPad->SetLogz();
+		fh_tofd_TotPm[3]->Draw("colz");		 
+		cTofd_planes->cd(18);gPad->SetLogz();
+		fh_tofd_ToF[3]->Draw("colz");
+		cTofd_planes->cd(19);gPad->SetLogz();
+		fh_tofd_multihit[3]->Draw("colz");
+		cTofd_planes->cd(20);gPad->SetLogz();
+		fh_tofd_dt[2]->Draw("colz");
+
+		cTofd_planes->cd(0);
+		run->AddObject(cTofd_planes);
+
+		run->GetHttpServer()->RegisterCommand("Reset_TOFD", Form("/Tasks/%s/->Reset_TOFD_Histo()", GetName())); 
+	}
+
+	if(fMappedItems.at(DET_SFIB)){
+
+		TCanvas *cSfib_det = new TCanvas("Sfib_det", "Sfib det",10,10, 510, 510);
+		cSfib_det->Divide(2,3);	
+
+		fh_sfib_Tot_top = new TH2F("sfib_Tot_top","SFIB ToT@Top",256,0,256,100,0.,600.); 
+		fh_sfib_Tot_top->GetXaxis()->SetTitle("Channel");
+		fh_sfib_Tot_top->GetYaxis()->SetTitle("ToT / ns");
+
+		fh_sfib_Tot_top1d = new TH1F("sfib_Tot_top1d","ToT@Top Dist",500,0.,500.); 
+		fh_sfib_Tot_top1d->GetXaxis()->SetTitle("ToT / ns");
+		fh_sfib_Tot_top1d->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_Tot_top_g = new TH2F("sfib_Tot_top_g","SFIB ToT@Top gate with Tot@Bot>100 ",256,0,256,100,0.,600.); 
+		fh_sfib_Tot_top_g->GetXaxis()->SetTitle("Channel");
+		fh_sfib_Tot_top_g->GetYaxis()->SetTitle("ToT / ns");
+
+		fh_sfib_Tot_top1d_g = new TH1F("sfib_Tot_top1d_g","ToT@Top Dist gate with Tot@Bot>100",500,0.,500.); 
+		fh_sfib_Tot_top1d_g->GetXaxis()->SetTitle("ToT / ns");
+		fh_sfib_Tot_top1d_g->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_Tot_bot = new TH2F("sfib_Tot_bot","SFIB ToT@Bot",256,0,256,100,0.,600.); 
+		fh_sfib_Tot_bot->GetXaxis()->SetTitle("Channel");
+		fh_sfib_Tot_bot->GetYaxis()->SetTitle("ToT / ns");
+	
+		fh_sfib_Tot_bot1d = new TH1F("sfib_Tot_bot1d","ToT@Bot Dist",500,0.,500.); 
+		fh_sfib_Tot_bot1d->GetXaxis()->SetTitle("ToT / ns");
+		fh_sfib_Tot_bot1d->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_Tot_bot_g = new TH2F("sfib_Tot_bot_g","SFIB ToT@Bot gate with ToT@Top>350",256,0,256,100,0.,600.); 
+		fh_sfib_Tot_bot_g->GetXaxis()->SetTitle("Channel");
+		fh_sfib_Tot_bot_g->GetYaxis()->SetTitle("ToT / ns");
+
+		fh_sfib_Tot_bot1d_g = new TH1F("sfib_Tot_bot1d_g","ToT@Bot Dist gate with Tot@Top>350",500,0.,500.); 
+		fh_sfib_Tot_bot1d_g->GetXaxis()->SetTitle("ToT / ns");
+		fh_sfib_Tot_bot1d_g->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_channels = new TH1F("sfib_channels","SFIB Channels",256,0,256); 
+		fh_sfib_channels->GetXaxis()->SetTitle("Channel");
+		fh_sfib_channels->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_channels_top = new TH1F("sfib_channels_top","SFIB Channels Top",256,0,256); 
+		fh_sfib_channels_top->GetXaxis()->SetTitle("Channel");
+		fh_sfib_channels_top->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_channels_bot = new TH1F("sfib_channels_bot","SFIB Channels Bottom",256,0,256); 
+		fh_sfib_channels_bot->GetXaxis()->SetTitle("Channel");
+		fh_sfib_channels_bot->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_channels_topvsbot = new TH2F("sfib_channels_topvsbot","SFIB Channels Top vs Bottom",256,0,256,256,0,256);
+		fh_sfib_channels_topvsbot->GetXaxis()->SetTitle("Top Channels");
+		fh_sfib_channels_topvsbot->GetYaxis()->SetTitle("Bottom Channels");
+
+		fh_sfib_channels_g = new TH1F("sfib_channels_g","SFIB Channels gate",256,0,256); 
+		fh_sfib_channels_g->GetXaxis()->SetTitle("Channel");
+		fh_sfib_channels_g->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_tofd = new TH2F("sfib_fib_tofd","SFIB Channel vs TOFD paddle",256,0,256,180,0,180);
+		fh_sfib_tofd->GetXaxis()->SetTitle("SFIB Channel");
+		fh_sfib_tofd->GetYaxis()->SetTitle("TOFD paddle");
+		
+		//eng run Dec 2019, no tofd but psp in front of sfib
+		fh_sfib_pspx = new TH2F("sfib_fib_pspx","SFIB Channel vs PSP strip",256,0,256,64,0,64);
+		fh_sfib_pspx->GetXaxis()->SetTitle("SFIB Channel");
+		fh_sfib_pspx->GetYaxis()->SetTitle("PSP strip");
+	
+		fh_sfib_tot_tvb = new TH2F("sfib_totb_tvb","SFIB TOT@Top vs TOT@Bot",500,100,600,500,100,600); 
+		fh_sfib_tot_tvb->GetXaxis()->SetTitle("ToT@Bot / ns");
+		fh_sfib_tot_tvb->GetYaxis()->SetTitle("ToT@Top / ns");
+
+		fh_sfib_fmult = new TH1F("sfib_fmult","SFIB fiber multiplicity",32,0,32);
+		fh_sfib_fmult->GetXaxis()->SetTitle("fiber multiplicity");
+		fh_sfib_fmult->GetYaxis()->SetTitle("Counts");
+		
+		fh_sfib_cmult = new TH1F("sfib_cmult","SFIB cluster multiplicity",32,0,32);
+		fh_sfib_cmult->GetXaxis()->SetTitle("cluster multiplicity");
+		fh_sfib_cmult->GetYaxis()->SetTitle("Counts");
+		
+		fh_sfib_fmult_g = new TH1F("sfib_fmult_g","SFIB fiber multiplicity with gate",32,0,32);
+		fh_sfib_fmult_g->GetXaxis()->SetTitle("fiber multiplicity");
+		fh_sfib_fmult_g->GetYaxis()->SetTitle("Counts");
+		
+		fh_sfib_cmult_g = new TH1F("sfib_cmult_g","SFIB cluster multiplicity with gate",32,0,32);
+		fh_sfib_cmult_g->GetXaxis()->SetTitle("cluster multiplicity");
+		fh_sfib_cmult_g->GetYaxis()->SetTitle("Counts");
+
+		fh_sfib_tot_ch_top1 = new TH1F("sfib_tot_ch_top1","SFIB TOT Top1 Channels",256,1,256); 
+		fh_sfib_tot_ch_top1->GetXaxis()->SetTitle("ToT@Top1 / ns");
+		fh_sfib_tot_ch_top1->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_ch_top1->SetStats(0);
+
+		fh_sfib_tot_ch_top2 = new TH1F("sfib_tot_ch_top2","SFIB TOT Top2 Channels",256,1,256); 
+		fh_sfib_tot_ch_top2->GetXaxis()->SetTitle("ToT@Top2 / ns");
+		fh_sfib_tot_ch_top2->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_ch_top2->SetStats(0);
+
+		fh_sfib_tot_ch_bot1 = new TH1F("sfib_tot_ch_bot1","SFIB TOT Bottom1 Channels",256,1,256); 
+		fh_sfib_tot_ch_bot1->GetXaxis()->SetTitle("ToT@Bottom1 / ns");
+		fh_sfib_tot_ch_bot1->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_ch_bot1->SetStats(0);
+
+		fh_sfib_tot_ch_bot2 = new TH1F("sfib_tot_ch_bot2","SFIB TOT Bottom2 Channels",256,1,256); 
+		fh_sfib_tot_ch_bot2->GetXaxis()->SetTitle("ToT@Bottom2 / ns");
+		fh_sfib_tot_ch_bot2->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_ch_bot2->SetStats(0);
+
+		fh_sfib_tot_max_top1 = new TH1F("sfib_tot_max_top1","SFIB TOT Top1 Maximum",119,5,600); 
+		fh_sfib_tot_max_top1->GetXaxis()->SetTitle("Maximum");
+		fh_sfib_tot_max_top1->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_max_top1->SetStats(0);
+
+		fh_sfib_tot_max_top2 = new TH1F("sfib_tot_max_top2","SFIB TOT Top2 Maximum",119,5,600); 
+		fh_sfib_tot_max_top2->GetXaxis()->SetTitle("Maximum");
+		fh_sfib_tot_max_top2->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_max_top2->SetStats(0);
+
+		fh_sfib_tot_max_bot1 = new TH1F("sfib_tot_max_bot1","SFIB TOT Bottom1 Maximum",119,5,600); 
+		fh_sfib_tot_max_bot1->GetXaxis()->SetTitle("Maximum");
+		fh_sfib_tot_max_bot1->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_max_bot1->SetStats(0);
+
+		fh_sfib_tot_max_bot2 = new TH1F("sfib_tot_max_bot2","SFIB TOT Bottom2 Maximum",119,5,600); 
+		fh_sfib_tot_max_bot2->GetXaxis()->SetTitle("Maximum");
+		fh_sfib_tot_max_bot2->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_max_bot2->SetStats(0);
+
+		fh_sfib_tot_ch_max_top1 = new TH2F("sfib_tot_ch_max_top1","SFIB TOT Top1 Channel vs Maximum",256,1,256,500,100,600); 
+		fh_sfib_tot_ch_max_top1->GetXaxis()->SetTitle("ToT@Top1 / ns");
+		fh_sfib_tot_ch_max_top1->GetYaxis()->SetTitle("Maximum");
+		fh_sfib_tot_ch_max_top1->SetStats(0);
+
+		fh_sfib_tot_ch_max_top2 = new TH2F("sfib_tot_ch_max_top2","SFIB TOT Top2 Channel vs Maximum",256,1,256,500,100,600); 
+		fh_sfib_tot_ch_max_top2->GetXaxis()->SetTitle("ToT@Top2 / ns");
+		fh_sfib_tot_ch_max_top2->GetYaxis()->SetTitle("Maximum");
+		fh_sfib_tot_ch_max_top2->SetStats(0);
+
+
+		fh_sfib_tot_ch_max_bot1 = new TH2F("sfib_tot_ch_max_bot1","SFIB TOT Bottom1 Channel vs Maximum",256,1,256,500,100,600); 
+		fh_sfib_tot_ch_max_bot1->GetXaxis()->SetTitle("ToT@Bottom1 / ns");
+		fh_sfib_tot_ch_max_bot1->GetYaxis()->SetTitle("Maximum");
+		fh_sfib_tot_ch_max_bot1->SetStats(0);
+
+		fh_sfib_tot_ch_max_bot2 = new TH2F("sfib_tot_ch_max_bot2","SFIB TOT Bottom2 Channel vs Maximum",256,1,256,500,100,600); 
+		fh_sfib_tot_ch_max_bot2->GetXaxis()->SetTitle("ToT@Bottom2 / ns");
+		fh_sfib_tot_ch_max_bot2->GetYaxis()->SetTitle("Maximum");
+		fh_sfib_tot_ch_max_bot2->SetStats(0);
+
+		fh_sfib_tot_ch_topbot1 = new TH2F("sfib_tot_ch_topbot1","SFIB TOT TopvsBottom1 Channel",256,1,256,256,1,256); 
+		fh_sfib_tot_ch_topbot1->GetXaxis()->SetTitle("ToT@Top1 / ns");
+		fh_sfib_tot_ch_topbot1->GetYaxis()->SetTitle("ToT!Bottom1 / ns");
+		fh_sfib_tot_ch_topbot1->SetStats(0);
+
+		fh_sfib_multi = new TH1F("sfib_multi","SFIB Multiplicity",5,1,6); 
+		fh_sfib_multi->GetXaxis()->SetTitle("Multiplicity");
+		fh_sfib_multi->GetYaxis()->SetTitle("Counts");
+		fh_sfib_multi->SetStats(0);
+
+		fh_sfib_clus = new TH1F("sfib_clus","SFIB Clustering",5,1,6);
+		fh_sfib_clus->GetXaxis()->SetTitle("Clustering");
+		fh_sfib_clus->GetYaxis()->SetTitle("Counts");
+		fh_sfib_clus->SetStats(0);
+
+		fh_sfib_multi_clus = new TH2F("sfib_multi_clus","SFIB Multiplicity vs Clustering",4,1,5,4,1,5); 
+		fh_sfib_multi_clus->GetXaxis()->SetTitle("Multiplicity");
+		fh_sfib_multi_clus->GetYaxis()->SetTitle("Clustering");
+		fh_sfib_multi_clus->SetStats(0);
+
+		fh_sfib_multi_ch_topbot1 = new TH2F("sfib_tot_multi_topbot1","SFIB Multiplicity TopvsBottom1 Channel",40,161,200,40,161,200); 
+		fh_sfib_multi_ch_topbot1->GetXaxis()->SetTitle("ToT@Top1 / ns");
+		fh_sfib_multi_ch_topbot1->GetYaxis()->SetTitle("ToT@Bottom1 / ns");
+		fh_sfib_multi_ch_topbot1->SetStats(0);
+
+		fh_sfib_tot_top_multi1 = new TH1F("sfib_tot_top_multi1","SFIB TOT Top Multiplicity1",119,5,600); 
+		fh_sfib_tot_top_multi1->GetXaxis()->SetTitle("ToT@Top1");
+		fh_sfib_tot_top_multi1->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_top_multi1->SetStats(0);
+
+		fh_sfib_tot_top_multi2 = new TH1F("sfib_tot_top_multi2","SFIB TOT Top Multiplicity2",119,5,600); 
+		fh_sfib_tot_top_multi2->GetXaxis()->SetTitle("ToT@Top2");
+		fh_sfib_tot_top_multi2->GetYaxis()->SetTitle("Counts");
+		fh_sfib_tot_top_multi2->SetStats(0);
+
+		
+		
+
+		cSfib_det->cd(1);
+		fh_sfib_channels_top->Draw();
+
+		cSfib_det->cd(2);
+		fh_sfib_channels_bot->Draw();
+
+		cSfib_det->cd(3);
+		xyline=new TF1("xyline","x",0,256);
+		fh_sfib_channels_topvsbot->Draw("colz");
+		xyline->Draw("same");
+
+		cSfib_det->cd(4);
+		fh_sfib_Tot_top1d->Draw();
+		
+		cSfib_det->cd(5);
+		fh_sfib_Tot_bot1d->Draw();
+
+		cSfib_det->cd(6);
+		fh_sfib_Tot_top1d_g->Draw();
+;
+
+
+/*
+		cSfib_det->cd(1);
+		fh_sfib_Tot_top->Draw("colz");
+
+		cSfib_det->cd(2);
+		fh_sfib_Tot_top1d->Draw();
+
+		cSfib_det->cd(3);
+		fh_sfib_Tot_top_g->Draw("colz");
+
+		cSfib_det->cd(4);
+		fh_sfib_Tot_top1d_g->Draw();
+
+		cSfib_det->cd(5);
+		fh_sfib_Tot_bot->Draw("colz");
+
+		cSfib_det->cd(6);
+		fh_sfib_Tot_bot1d->Draw();
+
+		cSfib_det->cd(7);
+		fh_sfib_Tot_bot_g->Draw("colz");
+
+		cSfib_det->cd(8);
+		fh_sfib_Tot_bot1d_g->Draw();
+
+		cSfib_det->cd(9);
+		fh_sfib_channels->Draw();
+
+		cSfib_det->cd(10);
+		fh_sfib_channels_g->Draw();
+		
+		cSfib_det->cd(11);
+		//fh_sfib_tofd->Draw("colz");
+		fh_sfib_pspx->Draw("colz");
+	
+		cSfib_det->cd(12);
+		fh_sfib_tot_tvb->Draw("colz");	   
+
+		cSfib_det->cd(13);
+		gPad->SetLogy();
+		fh_sfib_fmult->Draw();
+
+		cSfib_det->cd(14);
+		gPad->SetLogy();
+		fh_sfib_cmult->Draw();
+		
+		cSfib_det->cd(15);
+		gPad->SetLogy();
+		fh_sfib_fmult_g->Draw();
+	
+		cSfib_det->cd(16);
+		gPad->SetLogy();
+		fh_sfib_cmult_g->Draw();
+
+*/
+//		cSfib_det->cd(17);
+//		fh_sfib_tot_ch_top1->Draw();
+
+//		cSfib_det->cd(18);
+//		fh_sfib_tot_ch_top2->Draw();
+
+//		cSfib_det->cd(19);
+//		fh_sfib_tot_ch_bot1->Draw();
+
+//		cSfib_det->cd(20);
+//		fh_sfib_tot_ch_top1->Draw();
+
+//		cSfib_det->cd(21);
+//		fh_sfib_tot_max_top1->Draw();
+
+//		cSfib_det->cd(22);
+//		fh_sfib_tot_max_top2->Draw();
+
+//		cSfib_det->cd(23);
+//		fh_sfib_tot_max_bot1->Draw();
+
+//		cSfib_det->cd(24);
+//		fh_sfib_tot_max_bot2->Draw();
+
+//		cSfib_det->cd(25);
+//		fh_sfib_tot_ch_max_top1->Draw();
+
+//		cSfib_det->cd(26);
+//		fh_sfib_tot_ch_max_top2->Draw();
+//		cSfib_det->cd(27);
+//		fh_sfib_tot_ch_max_bot1->Draw();
+
+//		cSfib_det->cd(28);
+//		fh_sfib_tot_ch_max_bot2->Draw();
+
+//		cSfib_det->cd(29);
+//		fh_sfib_tot_ch_topbot1->Draw("colz");
+
+//		cSfib_det->cd(30);
+//		fh_sfib_multi->Draw();
+
+//		cSfib_det->cd(31);
+//		fh_sfib_clus->Draw();
+
+//		cSfib_det->cd(32);
+//		fh_sfib_multi_clus->Draw();
+
+//		cSfib_det->cd(33);
+//		fh_sfib_multi_ch_topbot1->Draw("colz");
+	  
+//		cSfib_det->cd(34);
+//		fh_sfib_tot_top_multi1->Draw();
+
+//		cSfib_det->cd(35);
+//		fh_sfib_tot_top_multi2->Draw();
+       
+		
+		
+		
+		run->AddObject(cSfib_det);
+	}
+	
+
+	// -------------------------------------------------------------------------
+
+    //------------------------------------------------------------------------
+    // PSPX detector
+    // get access to data
+    TCanvas* cPspx_comp = new TCanvas("Pspx_comp", "Pspx Comparison", 10, 10, 1100, 1000);
+    cPspx_comp->Divide(N_PSPX, 3);
+
+    Int_t Emax = 1000000;
+
+    if (fMappedItems.at(DET_PSPX))
+    {
+        // LOG(INFO) << "Init MappedPspx" << FairLogger::endl;
+
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            if (i % 2 == 0)
+            { // even numbers = read out with energy filter
+                fh_pspx_channel_x[i] =
+                    new TH1F(Form("pspx_%d_energyreadout_channel_x", i / 2),
+                             Form("Pspx %d Energy Readout: x Channel;x Position / Channel;Counts", i / 2 + 1),
+                             2 * N_STRIPS_PSPX,
+                             1,
+                             2 * N_STRIPS_PSPX + 1);
+                fh_pspx_channel_y[i] =
+                    new TH1F(Form("pspx_%d_energyreadout_channel_y", i / 2),
+                             Form("Pspx %d Energy Readout: y Channel;y Position / Channel;Counts", i / 2 + 1),
+                             2 * N_STRIPS_PSPX,
+                             2 * N_STRIPS_PSPX + 1,
+                             4 * N_STRIPS_PSPX + 1);
+
+                fh_pspx_multiplicity_x[i] =
+                    new TH1F(Form("pspx_%d_energyreadout_multiplicity_x", i / 2),
+                             Form("Pspx %d Energy Readout: x Multiplicity;Multiplicity;Counts", i / 2 + 1),
+                             10,
+                             0,
+                             10);
+                fh_pspx_multiplicity_y[i] =
+                    new TH1F(Form("pspx_%d_energyreadout_multiplicity_y", i / 2),
+                             Form("Pspx %d Energy Readout: y Multiplicity;Multiplicity;Counts", i / 2 + 1),
+                             10,
+                             0,
+                             10);
+                fh_pspx_strips_position[i] = new TH2F(
+                    Form("pspx_%d_energyreadout_strips", i),
+                    Form("Pspx %d Energy Readout Position;x Position / Strips; y Position / Strips", i / 2 + 1),
+                    N_STRIPS_PSPX,
+                    1,
+                    N_STRIPS_PSPX + 1,
+                    N_STRIPS_PSPX,
+                    N_STRIPS_PSPX + 1,
+                    2 * N_STRIPS_PSPX + 1);
+            }
+            else
+            { // odd numbers = read out with position filter
+                fh_pspx_channel_x[i] =
+                    new TH1F(Form("pspx_%d_positionreadout_channel_x", i / 2),
+                             Form("Pspx %d Position Readout: x Channel;x Position / Channel;Counts", i / 2 + 1),
+                             2 * N_STRIPS_PSPX,
+                             1,
+                             2 * N_STRIPS_PSPX + 1);
+                fh_pspx_channel_y[i] =
+                    new TH1F(Form("pspx_%d_positionreadout_channel_y", i / 2),
+                             Form("Pspx %d Position Readout: y Channel;y Position / Channel;Counts", i / 2 + 1),
+                             2 * N_STRIPS_PSPX,
+                             2 * N_STRIPS_PSPX + 1,
+                             4 * N_STRIPS_PSPX + 1);
+
+                fh_pspx_multiplicity_x[i] =
+                    new TH1F(Form("pspx_%d_positionreadout_multiplicity_x", i / 2),
+                             Form("Pspx %d Position Readout: x Multiplicity;Multiplicity;Counts", i / 2 + 1),
+                             10,
+                             0,
+                             10);
+                fh_pspx_multiplicity_y[i] =
+                    new TH1F(Form("pspx_%d_positionreadout_multiplicity_y", i / 2),
+                             Form("Pspx %d Position Readout: y Multiplicity;Multiplicity;Counts", i / 2 + 1),
+                             10,
+                             0,
+                             10);
+                fh_pspx_strips_position[i] = new TH2F(
+                    Form("pspx_%d_positionreadout_strips", i),
+                    Form("Pspx %d Position Readout Position;x Position / Strips; y Position / Strips", i / 2 + 1),
+                    N_STRIPS_PSPX,
+                    1,
+                    N_STRIPS_PSPX + 1,
+                    N_STRIPS_PSPX,
+                    N_STRIPS_PSPX + 1,
+                    2 * N_STRIPS_PSPX + 1);
+            }
+        }
+
+        TCanvas* cPspx_strips = new TCanvas("Pspx_strips", "Pspx Strips", 10, 10, 1100, 1000);
+        cPspx_strips->Divide(N_PSPX, 2);
+
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            cPspx_strips->cd(i + 1);
+            fh_pspx_channel_x[i]->Draw();
+
+            cPspx_strips->cd(i + 1 + N_PSPX);
+            fh_pspx_channel_y[i]->Draw();
+        }
+
+        run->AddObject(cPspx_strips);
+
+        TCanvas* cPspx_multiplicity = new TCanvas("Pspx_multiplicity", "Pspx Multiplicity", 10, 10, 1100, 1000);
+        cPspx_multiplicity->Divide(N_PSPX, 2);
+
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            cPspx_multiplicity->cd(i + 1);
+            fh_pspx_multiplicity_x[i]->Draw();
+
+            cPspx_multiplicity->cd(i + 1 + N_PSPX);
+            fh_pspx_multiplicity_y[i]->Draw();
+        }
+
+        run->AddObject(cPspx_multiplicity);
+
+        // Fill cPspx_comp with Mapped level data
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            cPspx_comp->cd(i + 1);
+            fh_pspx_strips_position[i]->Draw("colz");
+
+            // Remove the current axis
+            fh_pspx_strips_position[i]->GetYaxis()->SetLabelOffset(999);
+            fh_pspx_strips_position[i]->GetYaxis()->SetTickLength(0);
+
+            // Redraw the new inverted axis
+            gPad->Update();
+            TGaxis* newaxis = new TGaxis(gPad->GetUxmin(),
+                                         gPad->GetUymax(),
+                                         gPad->GetUxmin() - 0.001,
+                                         gPad->GetUymin(),
+                                         fh_pspx_strips_position[i]->GetYaxis()->GetXmin(),
+                                         fh_pspx_strips_position[i]->GetYaxis()->GetXmax(),
+                                         510,
+                                         "+");
+            newaxis->SetLabelOffset(0.003);
+            newaxis->SetLabelSize(0.03);
+            newaxis->SetTickLength(0.025);
+            newaxis->Draw();
+        }
+    }
+
+    if (fCalItems.at(DET_PSPX))
+    {
+        UInt_t nbins = 200;
+
+        for (UInt_t i = 0; i < N_PSPX ; i++)
+        {
+          if(i % 2 == 0 )
+          {
+            fh_pspx_cal_energy_frontback[i] =
+                new TH2F(Form("pspx_%d_energy_frontback", i/2),
+                         Form("Pspx %d Energy Back vs Front;Front Energy / arb.u.;Back Energy / arb.u.", i/2 + 1),
+                         nbins,
+                         0,
+                         Emax,
+                         nbins,
+                         -Emax,
+                         0);
+          }
+          else
+          {
+            fh_pspx_cal_energy_frontback[i] =
+                new TH2F(Form("pspx_%d_position_frontback", i/2),
+                         Form("Pspx %d Energy Back vs Front;Front Energy / arb.u.;Back Energy / arb.u.", i/2 + 1),
+                         nbins,
+                         0,
+                         Emax/4,
+                         nbins,
+                         -Emax/4,
+                         0);
+          
+          }
+        }
+
+	/*fh_pspx_cal_energy_corr[i] =
+                new TH2F("pspx_%d_energy_corr",
+                         "Pspx %d Energy PSP2 vs. PSP3;PSP2 Energy / arb.u.;PSP3 Energy / arb.u.",
+                         nbins,
+                         0,
+                         Emax,
+                         nbins,
+                         0,
+                         Emax);
+*/
+
+        // Fill cPspx_comp with Cal level data
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            cPspx_comp->cd(i + 1 + N_PSPX); //i*2
+            fh_pspx_cal_energy_frontback[i]->Draw("colz");
+        }
+    }
+
+    if (fHitItems.at(DET_PSPX))
+    {
+        UInt_t nbins = 100;
+        Double_t length = 10; // detector length, range of histogram
+
+        for (UInt_t i = 0; i < (N_PSPX + 1) / 2; i++)
+        {
+            fh_pspx_hit_position[i] = new TH2F(Form("pspx_%d_position_cm", i),
+                                               Form("Pspx %d Position;x Position / cm; y Position / cm", i + 1),
+                                               nbins,
+                                               -length / 4.,
+                                               length / 4.,
+                                               nbins,
+                                               -length / 4.,
+                                               length / 4.);
+
+            fh_pspx_hit_energy[i] = new TH1F(
+                Form("pspx_%d_energy", i), Form("Pspx %d Energy;Energy / arb.u.; Counts", i + 1), nbins, -Emax, Emax);
+        }
+
+        TCanvas* cPspx_hit = new TCanvas("Pspx_hit", "Pspx Hit", 10, 10, 1100, 1000);
+        cPspx_hit->Divide((N_PSPX + 1) / 2, 2);
+
+        for (UInt_t i = 0; i < (N_PSPX + 1) / 2; i++)
+        {
+            cPspx_hit->cd(i + 1);
+            fh_pspx_hit_position[i]->Draw("colz");
+
+            cPspx_hit->cd(i + 1 + (N_PSPX + 1) / 2);
+            fh_pspx_hit_energy[i]->Draw();
+        }
+
+        run->AddObject(cPspx_hit);
+
+        // Fill cPspx_comp with Hit level data-((channel_y[i][0] + 1) / 2) + 3 * N_STRIPS_PSPX + 1)
+        for (UInt_t i = 0; i < (N_PSPX + 1) / 2; i++)
+        {
+            cPspx_comp->cd(i * 2 + 2 * N_PSPX + 1); // supposed to be +2 if
+                                                    // energy and position
+                                                    // readout is used
+            fh_pspx_hit_position[i]->Draw("colz");
+        }
+    }
+
+    run->AddObject(cPspx_comp);
+
+    run->GetHttpServer()->RegisterCommand("Reset_PSPX", Form("/Tasks/%s/->Reset_PSPX_Histo()", GetName()));
+    
+    // -------------------------------------------------------------------------
+
+    return kSUCCESS;
+}
+
+void R3BOnlineSpectra::Reset_LOS_Histo()
+{
+    fh_los_channels->Reset();
+    fh_los_tres_MCFD->Reset();
+    fh_los_tres_TAMEX->Reset();
+    fh_los_pos_ToT->Reset();
+    fh_los_tot->Reset();
+    fh_los_tot_mean->Reset();
+    fh_los_pos_MCFD->Reset();
+    fh_los_pos_TAMEX->Reset();    
+    fh_los_dt_hits->Reset();
+    fh_los_dt_hits_l->Reset();
+    fh_los_dt_hits_t->Reset();
+    fh_los_multihit->Reset();
+    fh_los_ihit_ToT->Reset();
+}
+
+void R3BOnlineSpectra::Reset_BMON_Histo()
+{
+    fhTrigger->Reset();
+    fhTpat->Reset();
+    fh_SEETRAM->Reset();
+    fh_IC->Reset();
+    fh_TOFDOR->Reset();
+}
+
+void R3BOnlineSpectra::Reset_SCI8_Histo()
+{
+    fh_sci8_channels->Reset();
+    fh_sci8_tres_MCFD->Reset();
+    fh_sci8_tres_TAMEX->Reset();
+    fh_sci8_tot->Reset();
+    fh_sci8_tot_mean->Reset();
+    fh_sci8_dt_hits->Reset();
+    fh_sci8_dt_hits_l->Reset();
+    fh_sci8_dt_hits_t->Reset();
+    fh_sci8_multihit->Reset();
+    fh_sci8_multihitVFTX->Reset();
+    fh_sci8_multihitLEAD->Reset();
+    fh_sci8_multihitTRAI->Reset();
+    fh_tof_sci8->Reset();
+}
+void R3BOnlineSpectra::Reset_TOFD_Histo()
+{
+    for (int i = 0; i < N_PLANE_MAX_TOFD; i++)
+    {
+        fh_tofd_channels[i]->Reset();
+        fh_tofd_multihit[i]->Reset();
+        fh_tofd_ToF[i]->Reset();
+        fh_tofd_TotPm[i]->Reset();
+    }
+    fh_tofd_dt[0]->Reset();
+    fh_tofd_dt[1]->Reset();
+    fh_tofd_dt[2]->Reset();
+}
+void R3BOnlineSpectra::Reset_FIBERS_Histo()
+{
+    if (fMappedItems.at(DET_PSPX))
+    {
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            fh_pspx_channel_x[i]->Reset();
+            fh_pspx_channel_y[i]->Reset();
+            fh_pspx_multiplicity_x[i]->Reset();
+            fh_pspx_multiplicity_y[i]->Reset();
+            fh_pspx_strips_position[i]->Reset();
+        }
+    }
+    if (fCalItems.at(DET_PSPX))
+    {
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            fh_pspx_cal_energy_frontback[i]->Reset();
+        }
+    }
+    if (fHitItems.at(DET_PSPX))
+    {
+        for (UInt_t i = 0; i < N_PSPX / 2; i++)
+        {
+            fh_pspx_hit_position[i]->Reset();
+            fh_pspx_hit_energy[i]->Reset();
+        }
+    }
+	for(Int_t ifibcount = 0; ifibcount < NOF_FIB_DET; ifibcount++){
+		if(fMappedItems.at(DET_FI_FIRST + ifibcount)) {
+			fh_channels_Fib[ifibcount]->Reset();
+			fh_multihit_m_Fib[ifibcount]->Reset(); 
+			fh_multihit_s_Fib[ifibcount]->Reset();      
+			fh_fibers_Fib[ifibcount]->Reset();
+			fh_mult_Fib[ifibcount]->Reset();      
+			fh_ToT_m_Fib[ifibcount]->Reset();
+			fh_ToT_s_Fib[ifibcount]->Reset();
+			fh_Fib_ToF[ifibcount]->Reset();
+			fh_Fib_pos[ifibcount]->Reset();
+			fh_Fib_vs_Events[ifibcount]->Reset();   
+		}     
+     }
+}
+
+void R3BOnlineSpectra::Exec(Option_t* option)
+{
+//  cout << "fNEvents " << fNEvents << endl;
+
+	  FairRootManager* mgr = FairRootManager::Instance();
+  if (NULL == mgr){
+    //FairLogger::GetLogger()->Fatal(MESSAGE_ORIGIN, "FairRootManager not found");
+    LOG(ERROR) <<  "FairRootManager not found" <<FairLogger::endl;
+   return;
+  }
+  
+ // Double_t time_spill_start, time_spill_end;
+  
+  if(header->GetTrigger() == 12)   time_spill_start =  header->GetTimeStamp();    // spill start in nsec
+  if(header->GetTrigger() == 13)   time_spill_end =  header->GetTimeStamp();    // spill end  in nsec
+  
+//  if(header->GetTrigger() == 12)   cout<<"SPILL START: "<<fNEvents<<"; "<<header->GetTrigger()<<", "<<header->GetTimeStamp()<<endl;
+//  if(header->GetTrigger() == 13)   cout<<"SPILL END  : "<<fNEvents<<"; "<<header->GetTrigger()<<", "<<header->GetTimeStamp()<<endl;
+
+
+// fh_spill_length->Fill(time_spill_start-time_spill_end);
+  
+ if(fMappedItems.at(DET_BMON)){ 
+  fhTrigger->Fill(header->GetTrigger());
+}
+  
+ 
+//   check for requested trigger (Todo: should be done globablly / somewhere else)
+  if ((fTrigger >= 0) && (header) && (header->GetTrigger() != fTrigger))
+    return;   
+    
+
+
+
+ if(fMappedItems.at(DET_BMON)){ 
+ Int_t tpatbin; 
+ for(int i = 0; i < 16; i++){  
+  tpatbin = (header->GetTpat() & (1 << i));
+  if(tpatbin != 0) fhTpat->Fill(i+1);
+ }  
+}
+ 
+ 
+if(fMappedItems.at(DET_BMON)){
+	
+	auto det = fMappedItems.at(DET_BMON);
+    Int_t nHitsbm = det->GetEntriesFast();
+    
+    for (Int_t ihit = 0; ihit < nHitsbm; ihit++)
+    {
+      R3BBeamMonitorMappedData* hit = (R3BBeamMonitorMappedData*)det->At(ihit);
+      if (!hit) continue;
+
+      signed long long IC = hit->GetIC(); // negative values if offset not high enough
+      signed long long SEETRAM = hit->GetSEETRAM();  // negative values if offset not high enough
+      unsigned long long TOFDOR = hit->GetTOFDOR(); // only positive values possible
+      
+      unsigned long long time = header->GetTimeStamp();
+      
+      if(fNEvents == 0 ){ //|| header->GetTrigger() == 13) {
+		  time_bmon_mem = time;
+          see_mem = SEETRAM;
+          ic_mem = IC;
+          tofdor_mem = TOFDOR;
+       }   
+       
+     //  cout<<"IC: "<< (time-time_bmon_mem)/1e9<<"; "<<IC<<"; "<<ic_mem<<"; "<<header->GetTrigger()<<endl;
+       
+      fh_IC->Fill((time-time_bmon_mem)/1.e9,IC-ic_mem);
+     
+      fh_SEETRAM->Fill((time-time_bmon_mem)/1.e9,SEETRAM-see_mem);
+     
+      fh_TOFDOR->Fill((time-time_bmon_mem)/1.e9,TOFDOR-tofdor_mem);
+      
+      				         
+    }
+
+} 
+   
+ //fhTpat->Fill(header->GetTpat());
+ // fTpat = 1-16; fTpat_bit = 0-15
+ Int_t fTpat_bit = fTpat - 1; 
+ Int_t itpat;
+ Int_t tpatvalue;
+ if(fTpat_bit >= 0)  
+ {                    
+   itpat = header->GetTpat(); 
+   tpatvalue = (itpat & (1 << fTpat_bit)) >> fTpat_bit;
+   
+  // cout<<"Tpatval: "<<tpatvalue<<", "<<itpat<<endl;
+   if( (tpatvalue == 0)) return;
+  }
+     
+     
+  //----------------------------------------------------------------------
+  // LOS detector
+  //----------------------------------------------------------------------
+  // Time nomenclature for LOS:
+  // lt=0, l=1,lb=2,b=3,rb=4,r=5,rt=6,t=7   
+  //   t / \lt
+  //   rt| |l
+  //   r | |lb
+  //   rb\ /b 
+
+  
+
+  Double_t timeTofd=0;
+  Double_t time_V[10][8] = {0.0/0.0};  // [multihit][pm]         
+  Double_t time_L[10][8] = {0.0/0.0};
+  Double_t time_T[10][8] = {0.0/0.0};          
+  Double_t timeLosM[10] = {0.0};
+  Double_t LosTresM[10] = {0.0/0.0};
+  Double_t timeLosT[10] = {0.0};
+  Double_t LosTresT[10] = {0.0/0.0};
+  Double_t timeLos[10] = {0.0};
+  Double_t totsum[10] = {0.0}; 
+  Double_t tot[10][8] = {0.0/0.0};
+  Double_t xT_cm[10] = {0.0/0.0};
+  Double_t yT_cm[10] = {0.0/0.0};
+  Double_t xToT_cm[10] = {0.0/0.0};
+  Double_t yToT_cm[10] = {0.0/0.0};
+  Double_t xV_cm[10] = {0.0/0.0};
+  Double_t yV_cm[10] = {0.0/0.0};  
+  Double_t time_V_temp[10][8] = {0.0/0.0};
+
+  Int_t Multip;
+
+  if(fMappedItems.at(DET_LOS))
+  {
+    auto det = fMappedItems.at(DET_LOS);
+    Int_t nHits = det->GetEntriesFast();
+
+
+    Multip = nHits;
+
+    for (Int_t ihit = 0; ihit < nHits; ihit++)
+    {
+      R3BLosMappedData* hit = (R3BLosMappedData*)det->At(ihit);
+      if (!hit) continue;
+
+      // channel numbers are stored 1-based (1..n)
+      Int_t iDet = hit->GetDetector(); // 1..
+      Int_t iCha = hit->GetChannel();  // 1..
+
+      fh_los_channels->Fill(iCha);				         
+    }
+  }
+
+
+  Int_t nPart;   
+  if(fCalItems.at(DET_LOS))
+  {
+	Bool_t LOSID = false;
+
+    auto det = fCalItems.at(DET_LOS);
+    nPart = det->GetEntriesFast(); 
+  
+	
+    Int_t iDet = 0;
+    
+    Int_t nPart_VFTX[8] = {0};
+    Int_t nPart_LEAD[8] = {0};
+    Int_t nPart_TRAI[8] = {0};
+
+    
+
+    for (Int_t iPart = 0; iPart < nPart; iPart++) 
+   {
+      /* 
+       * nPart is the number of particle passing through LOS detector in one event
+       */ 
+      R3BLosCalData *calData = (R3BLosCalData*)det->At(iPart);
+      iDet=calData->GetDetector();
+           
+     for(Int_t iCha = 0; iCha < 8; iCha++){
+		 
+	  time_V[iPart][iCha] = 0./0.;   
+	  if(!(IS_NAN(calData->GetTimeV_ns(iCha)))){   // VFTX
+		nPart_VFTX[iCha] += 1;
+	  	time_V[iPart][iCha] = calData->GetTimeV_ns(iCha);
+	  }	
+	  	  
+	  time_L[iPart][iCha] = 0./0.;
+	  if(!(IS_NAN(calData->GetTimeL_ns(iCha)))){   // TAMEX leading
+		nPart_LEAD[iCha] += 1;
+		time_L[iPart][iCha]=calData->GetTimeL_ns(iCha);
+	  }	
+	  time_T[iPart][iCha] = 0./0.;
+	  if(!(IS_NAN(calData->GetTimeT_ns(iCha)))){   // TAMEX trailing
+		nPart_TRAI[iCha] += 1;
+		time_T[iPart][iCha]=calData->GetTimeT_ns(iCha); 
+	  }
+      
+     }
+     
+     if (!calData) 
+         {
+		   cout<<"LOS !calData"<<endl;	 
+           continue; // can this happen?
+         }
+    }
+    
+ // Sorting VFTX data:
+
+	std::qsort(time_V, nPart, sizeof(*time_V),
+        [](const void *arg1, const void *arg2)->int
+        {
+            double const *lhs = static_cast<double const*>(arg1);
+            double const *rhs = static_cast<double const*>(arg2);
+                       
+            return (lhs[0] < rhs[0]) ? -1
+                :  ((rhs[0] < lhs[0]) ? 1 : 0);
+        });
+// End sorting      
+     
+       fNEvents_LOS = fNEvents_LOS+1;
+     //  cout<<"fNEvents LOS= "<<fNEvents_LOS<<endl;
+        
+    for (Int_t iPart = 0; iPart < nPart; iPart++)     
+    {
+		   
+      Bool_t iLOSTypeMCFD = false;
+	  Bool_t iLOSTypeTAMEX = false;
+	  Bool_t iLOSType = false;
+	     
+      if( time_V[iPart][0] > 0. && !(IS_NAN(time_V[iPart][0])) && time_V[iPart][1] > 0. && !(IS_NAN(time_V[iPart][1])) && 
+          time_V[iPart][2] > 0. && !(IS_NAN(time_V[iPart][2])) && time_V[iPart][3] > 0. && !(IS_NAN(time_V[iPart][3])) &&
+          time_V[iPart][4] > 0. && !(IS_NAN(time_V[iPart][4])) && time_V[iPart][5] > 0. && !(IS_NAN(time_V[iPart][5])) && 
+          time_V[iPart][6] > 0. && !(IS_NAN(time_V[iPart][6])) && time_V[iPart][7] > 0. && !(IS_NAN(time_V[iPart][7]))          
+      )
+      {        
+         iLOSTypeMCFD = true; // all 8 MCFD times
+      } 
+      
+      if( time_L[iPart][0] > 0. && !(IS_NAN(time_L[iPart][0])) && time_L[iPart][1] > 0. && !(IS_NAN(time_L[iPart][1])) && 
+          time_L[iPart][2] > 0. && !(IS_NAN(time_L[iPart][2])) && time_L[iPart][3] > 0. && !(IS_NAN(time_L[iPart][3])) &&
+          time_L[iPart][4] > 0. && !(IS_NAN(time_L[iPart][4])) && time_L[iPart][5] > 0. && !(IS_NAN(time_L[iPart][5])) && 
+          time_L[iPart][6] > 0. && !(IS_NAN(time_L[iPart][6])) && time_L[iPart][7] > 0. && !(IS_NAN(time_L[iPart][7])) &&
+          
+          time_T[iPart][0] > 0. && !(IS_NAN(time_T[iPart][0])) && time_T[iPart][1] > 0. && !(IS_NAN(time_T[iPart][1])) && 
+          time_T[iPart][2] > 0. && !(IS_NAN(time_T[iPart][2])) && time_T[iPart][3] > 0. && !(IS_NAN(time_T[iPart][3])) &&
+          time_T[iPart][4] > 0. && !(IS_NAN(time_T[iPart][4])) && time_T[iPart][5] > 0. && !(IS_NAN(time_T[iPart][5])) && 
+          time_T[iPart][6] > 0. && !(IS_NAN(time_T[iPart][6])) && time_T[iPart][7] > 0. && !(IS_NAN(time_T[iPart][7]))
+       )
+      {        
+         iLOSTypeTAMEX = true; // all 8 leading and trailing times       
+      }     
+
+      
+// We will consider only events in which booth MCFD and TAMEX see same number of channels:
+      if(iLOSTypeTAMEX  && iLOSTypeMCFD ) iLOSType = true;
+
+
+      if(iDet==1)
+      {
+
+
+	if(1==1) //(iLOSType)
+	{ 
+		
+	  int nPMT = 0;
+	  int nPMV = 0;	        
+
+	  for(int ipm=0; ipm<8; ipm++)
+	  { 
+		  		  	  
+		tot[iPart][ipm] = 0./0.;      
+	    if(time_T[iPart][ipm] > 0. &&  time_L[iPart][ipm] > 0. && !(IS_NAN(time_T[iPart][ipm])) && !(IS_NAN(time_L[iPart][ipm]))) 
+	    {     
+	      while(time_T[iPart][ipm] - time_L[iPart][ipm] <= 0.) 
+	      {
+		    time_T[iPart][ipm] = time_T[iPart][ipm] + 2048.*fClockFreq; 
+	      }
+
+	      nPMT = nPMT +1;
+	      tot[iPart][ipm] = time_T[iPart][ipm] - time_L[iPart][ipm];
+	    }
+
+	    if(tot[iPart][ipm] != 0. && !(IS_NAN(tot[iPart][ipm]))) totsum[iPart] += tot[iPart][ipm];
+
+
+	    if(time_L[iPart][ipm] > 0. && !(IS_NAN(time_L[iPart][ipm]))) timeLosT[iPart] += time_L[iPart][ipm];
+
+	    if(time_V[iPart][ipm] > 0. && !(IS_NAN(time_V[iPart][ipm]))) 
+	    {
+	      timeLosM[iPart] += time_V[iPart][ipm];
+	      nPMV = nPMV + 1;
+	    }	 
+	  }
+
+	   totsum[iPart] = totsum[iPart]/nPMT;
+	  
+	  timeLosM[iPart] = timeLosM[iPart]/nPMV;
+
+	  timeLosT[iPart] = timeLosT[iPart]/nPMT;
+
+	  timeLos[iPart] = timeLosM[iPart];
+
+
+	   LosTresM[iPart] = ((time_V[iPart][0]+time_V[iPart][2]+time_V[iPart][4]+time_V[iPart][6]) - 
+	      (time_V[iPart][1]+time_V[iPart][3]+time_V[iPart][5]+time_V[iPart][7]))/4.;  	 
+     
+       LosTresT[iPart] = ((time_L[iPart][0]+time_L[iPart][2]+time_L[iPart][4]+time_L[iPart][6]) - 
+	      (time_L[iPart][1]+time_L[iPart][3]+time_L[iPart][5]+time_L[iPart][7]))/4.;  
+
+
+	  // Position from tamex:    
+      xT_cm[iPart] = ((time_L[iPart][5]+time_L[iPart][6])/2.-(time_L[iPart][1]+time_L[iPart][2])/2.)*(-1.);                  
+      yT_cm[iPart] = ((time_L[iPart][7]+time_L[iPart][0])/2.-(time_L[iPart][3]+time_L[iPart][4])/2.)*(-1.);
+      xT_cm[iPart] = (xT_cm[iPart] - flosOffsetXT) * flosVeffXT;
+      yT_cm[iPart] = (yT_cm[iPart] - flosOffsetYT) * flosVeffYT;
+      
+      // Position from VFTX:
+      xV_cm[iPart] = ((time_V[iPart][5]+time_V[iPart][6])/2.-(time_V[iPart][1]+time_V[iPart][2])/2.)*(-1.);                  
+      yV_cm[iPart] = ((time_V[iPart][7]+time_V[iPart][0])/2.-(time_V[iPart][3]+time_V[iPart][4])/2.)*(-1.);
+      xV_cm[iPart] = (xV_cm[iPart] - flosOffsetXV) * flosVeffXV;
+      yV_cm[iPart] = (yV_cm[iPart] - flosOffsetYV) * flosVeffYV;
+    
+      // Position from ToT:                       		   
+      xToT_cm[iPart] = (((tot[iPart][5]+tot[iPart][6])/2.-(tot[iPart][1]+tot[iPart][2])/2.)/
+                      ((tot[iPart][1]+tot[iPart][2]+tot[iPart][5]+tot[iPart][6])/4.));
+                          
+      yToT_cm[iPart] = (((tot[iPart][0]+tot[iPart][7])/2.-(tot[iPart][3]+tot[iPart][4])/2.)/
+                      ((tot[iPart][7]+tot[iPart][0]+tot[iPart][3]+tot[iPart][4])/4.));     
+                                     
+      xToT_cm[iPart] = (xToT_cm[iPart]-flosOffsetXQ)*flosVeffXQ;
+      yToT_cm[iPart] = (yToT_cm[iPart]-flosOffsetYQ)*flosVeffYQ;
+	 	 
+  
+     if(nPMV == 8 && nPMT == 8 ){
+		 
+     fh_los_tot_mean->Fill(totsum[iPart]);
+     
+     if(iPart < 1 ) {
+			Double_t timediff=float(header->GetTimeStamp()-time_V_mem);
+			fh_los_dt_first_ToT->Fill(timediff,totsum[iPart]);
+	 }			 
+	 
+	 if(iPart > 0) fh_los_dt_hits_ToT->Fill(timeLosM[iPart]-timeLosM[iPart-1],totsum[iPart]);
+
+      for(int ipm=0; ipm<8; ipm++)
+	  {
+	    fh_los_tot->Fill(ipm+1,tot[iPart][ipm]);
+	    	    	
+	      
+	   }
+	     
+      	  	 		 
+	  fh_los_tres_MCFD->Fill(LosTresM[iPart]);
+	  fh_los_tres_TAMEX->Fill(LosTresT[iPart]);
+      fh_los_pos_MCFD->Fill(xV_cm[iPart],yV_cm[iPart]);
+	  fh_los_pos_TAMEX->Fill(xT_cm[iPart],yT_cm[iPart]); 
+	  fh_los_pos_ToT->Fill(xToT_cm[iPart],yToT_cm[iPart]);
+	  fh_los_ihit_ToT->Fill(iPart,totsum[iPart]);
+	  fh_los_multihit->Fill(iPart+1); 
+	 
+     }  
+	}     
+
+     if(iPart == nPart-1)  time_V_mem = header->GetTimeStamp();  // memorize time of the last hit
+
+      } 
+      else 
+      {
+	cout<<"Wrong detector ID for LOS!"<<endl;
+      }
+    } 
+        
+  }	
+
+
+  //----------------------------------------------------------------------
+  // SCI8 detector
+  //----------------------------------------------------------------------
+
+  Double_t timeS8_V[10][2] = {0.0/0.0};  // [multihit][pm]         
+  Double_t timeS8_L[10][2] = {0.0/0.0};
+  Double_t timeS8_T[10][2] = {0.0/0.0};          
+  Double_t timeSci8M[10] = {0.0};
+  Double_t Sci8TresM[10] = {0.0/0.0};
+  Double_t timeSci8T[10] = {0.0};
+  Double_t Sci8TresT[10] = {0.0/0.0};
+  Double_t timeSci8[10] = {0.0};
+  Double_t totsumS8[10] = {0.0}; 
+  Double_t totS8[10][8] = {0.0/0.0};
+
+  Int_t MultipS8;
+
+  if(fMappedItems.at(DET_SCI8))
+  {
+    auto det = fMappedItems.at(DET_SCI8);
+    Int_t nHits = det->GetEntriesFast();
+
+    MultipS8 = nHits;
+
+    for (Int_t ihit = 0; ihit < nHits; ihit++)
+    {
+      R3BSci8MappedData* hit = (R3BSci8MappedData*)det->At(ihit);
+      if (!hit) continue;
+
+      // channel numbers are stored 1-based (1..n)
+      Int_t iDet = hit->GetDetector(); // 1..
+      Int_t iCha = hit->GetChannel();  // 1..
+
+      fh_sci8_channels->Fill(iCha);				         
+    }
+  }
+
+
+  Int_t nPartS8;   
+
+  if(fCalItems.at(DET_SCI8))
+  {
+    auto det = fCalItems.at(DET_SCI8);
+    nPartS8 = det->GetEntriesFast();  
+
+    fh_sci8_multihit->Fill(nPartS8);
+
+    Int_t iDet = 0;
+    Int_t nPartS8_VFTX[2] = {0};
+    Int_t nPartS8_LEAD[2] = {0};
+    Int_t nPartS8_TRAI[2] = {0};
+
+    for (Int_t iPart = 0; iPart < nPartS8; iPart++)     
+    {
+
+      /* 
+       * nPart is the number of particle passing through Sci8 detector in one event
+       */ 
+
+      R3BSci8CalData *calDataS8 = (R3BSci8CalData*)det->At(iPart);
+      iDet = calDataS8->GetDetector();
+
+
+      // VFTX Channels 1-2:
+      if(!(IS_NAN(calDataS8->fTimeV_r_ns))) {
+	timeS8_V[iPart][0] = calDataS8->fTimeV_r_ns;
+	nPartS8_VFTX[0] += 1;
+      }	  
+      if(!(IS_NAN(calDataS8->fTimeV_l_ns))) {
+	timeS8_V[iPart][1] = calDataS8->fTimeV_l_ns;
+	nPartS8_VFTX[1] += 1;
+      }	
+
+      // TAMEX Channels 1-2:      
+      if(!(IS_NAN(calDataS8->fTimeL_r_ns))) {
+	timeS8_L[iPart][0] = calDataS8->fTimeL_r_ns;
+	nPartS8_LEAD[0] += 1;
+      }	
+      if(!(IS_NAN(calDataS8->fTimeT_r_ns))) {
+	timeS8_T[iPart][0] = calDataS8->fTimeT_r_ns;
+	nPartS8_TRAI[0] += 1;
+      }	
+      if(!(IS_NAN(calDataS8->fTimeL_l_ns))) {
+	timeS8_L[iPart][1] = calDataS8->fTimeL_l_ns;
+	nPartS8_LEAD[1] += 1;
+      }	
+      if(!(IS_NAN(calDataS8->fTimeT_l_ns))) {
+	timeS8_T[iPart][1] = calDataS8->fTimeT_l_ns;
+	nPartS8_TRAI[1] += 1;
+      }	  
+
+
+
+      if(iPart > 0 && MultipS8%2 == 0) 
+      {
+	for(int k=0; k<2; k++) 
+	{
+	  if(timeS8_V[iPart][k] > 0. && timeS8_V[iPart-1][k] > 0. && !(IS_NAN(timeS8_V[iPart][k])) && !(IS_NAN(timeS8_V[iPart-1][k]))) 
+	  {
+	    fh_sci8_dt_hits->Fill(timeS8_V[iPart][k]-timeS8_V[iPart-1][k]); 
+	  }
+	  if(timeS8_L[iPart][k] > 0. && timeS8_L[iPart-1][k] > 0. && !(IS_NAN(timeS8_L[iPart][k])) && !(IS_NAN(timeS8_L[iPart-1][k]))) 
+	  {
+	    fh_sci8_dt_hits_l->Fill(timeS8_L[iPart][k]-timeS8_L[iPart-1][k]); 
+	  }
+	  if(timeS8_T[iPart][k] > 0. && timeS8_T[iPart-1][k] > 0. && !(IS_NAN(timeS8_T[iPart][k])) && !(IS_NAN(timeS8_T[iPart-1][k]))) 
+	  {
+	    fh_sci8_dt_hits_t->Fill(timeS8_T[iPart][k]-timeS8_T[iPart-1][k]); 
+	  }
+	}	
+      }	  
+
+      if(iDet==1)
+      {
+
+	//if(iPart >= 0)
+	if(1 == 1)
+	{ 
+	  int nPMT = 0;
+	  int nPMV = 0;	        
+	  int ilc = iPart;
+
+	  for(int ipm=0; ipm<2; ipm++)
+	  {
+
+	    if(timeS8_T[iPart][ipm] > 0. &&  timeS8_L[iPart][ipm] > 0. && !(IS_NAN(timeS8_T[iPart][ipm])) && !(IS_NAN(timeS8_L[iPart][ipm]))) 
+	    {     
+	      while(timeS8_T[iPart][ipm] - timeS8_L[iPart][ipm] < 0.) 
+	      {
+		timeS8_T[iPart][ipm] = timeS8_T[iPart][ipm] + 2048.*fClockFreq; 
+	      }
+
+	      nPMT = nPMT +1;
+	      totS8[iPart][ipm] = timeS8_T[iPart][ipm] - timeS8_L[iPart][ipm];
+	    }
+
+	    totsumS8[iPart] += totS8[iPart][ipm];
+
+	    if(totS8[iPart][ipm] != 0. && !(IS_NAN(totS8[iPart][ipm]))) fh_sci8_tot->Fill(ipm+1,totS8[iPart][ipm]);
+
+	    if(timeS8_L[iPart][ipm] > 0. && !(IS_NAN(timeS8_L[iPart][ipm]))) timeSci8T[iPart] += timeS8_L[iPart][ipm];
+
+	    if(timeS8_V[iPart][ipm] > 0. && !(IS_NAN(timeS8_V[iPart][ipm]))) 
+	    {
+	      timeSci8M[iPart] += timeS8_V[iPart][ipm];
+	      nPMV = nPMV + 1;
+	    }	 
+	  }
+
+	  totsumS8[iPart] = totsumS8[iPart]/nPMT;
+	  /* 
+	     if(totsum[iPart] < 88.) cout<<fNEvents<<"; "<<nPart<<"; "<<iPart<<", "<<totsum[iPart]<<tot[iPart][0]<<
+	     ", "<<tot[iPart][1]<<", " <<tot[iPart][2]<<", "<<tot[iPart][3]<<", "<<tot[iPart][4]<<", "
+	     <<tot[iPart][5]<<", "<<tot[iPart][6]<<", "<<tot[iPart][7]<<endl;
+	   */ 
+	  timeSci8M[iPart] = timeSci8M[iPart]/nPMV;
+	  timeSci8T[iPart] = timeSci8T[iPart]/nPMT;  
+
+	  timeSci8[iPart] = timeSci8M[iPart]; 
+	  fh_tof_sci8->Fill(timeSci8[iPart]-timeLos[ilc]); 
+
+	  // cout<<"TOF "<<timeSci8[iPart]-timeLos[ilc]<<endl;             
+
+	  if(nPMV == 2) Sci8TresM[iPart] = (timeS8_V[iPart][1]-timeS8_V[iPart][0]);  	  		          
+	  if(nPMT == 2) Sci8TresT[iPart] = (timeS8_L[iPart][1]-timeS8_L[iPart][0]);  
+
+	  if(nPMV == 2) fh_sci8_tres_MCFD->Fill(Sci8TresM[iPart]);
+	  if(nPMT == 2) fh_sci8_tres_TAMEX->Fill(Sci8TresT[iPart]);
+	  if(nPMT == 2) fh_sci8_tot_mean->Fill(totsumS8[iPart]);
+	}     
+
+      } 
+      else 
+      {
+	cout<<"Wrong detector ID for Sci8!"<<endl;
+      }
+    } 
+
+    for(int ik=0; ik<2; ik++)
+    {	
+      fh_sci8_multihitVFTX->Fill(ik+1,nPartS8_VFTX[ik]);
+      fh_sci8_multihitLEAD->Fill(ik+1,nPartS8_LEAD[ik]);
+      fh_sci8_multihitTRAI->Fill(ik+1,nPartS8_TRAI[ik]);
+    }    
+  }	
+
+
+
+
+
+
+
+
+  //----------------------------------------------------------------------
+  // Fiber detectors
+  //----------------------------------------------------------------------
+  Double_t dtime = 0.0/0.0;
+
+  for(Int_t ifibcount = 0; ifibcount < NOF_FIB_DET; ifibcount++)
+  { 
+
+    Int_t iFib = 0;  
+
+    auto detMapped = fMappedItems.at(DET_FI_FIRST + ifibcount);
+    auto detHit = fHitItems.at(DET_FI_FIRST + ifibcount);
+
+    if(detMapped) 
+    {
+      Int_t nHits = detMapped->GetEntriesFast();
+      std::vector<UInt_t> mapmt_num(512);
+      std::vector<UInt_t> spmt_num(16);
+      for (Int_t ihit = 0; ihit < nHits; ihit++)
+      {
+	R3BBunchedFiberMappedData* hit = (R3BBunchedFiberMappedData*)detMapped->At(ihit);
+	if (!hit) continue;
+
+	// channel numbers are stored 1-based (1..n)
+	Int_t iCha = hit->GetChannel();  // 1..
+
+	if (hit->IsMAPMT() && hit->IsLeading()) 
+	{
+	  fh_channels_Fib[ifibcount]->Fill(iCha);    // Fill which clockTDC channel has events
+
+	  ++mapmt_num.at(hit->GetChannel() - 1);     // multihit of a given clockTDC channel
+	}
+
+	if (!hit->IsMAPMT() && hit->IsLeading()) 
+	{
+
+	  ++spmt_num.at(hit->GetChannel() - 1);      // multihit of a given PADI channel
+	}
+      }
+
+      for (int i = 0; i < 512; ++i) 
+      { 
+	auto m = mapmt_num.at(i);
+	if(m > 0) fh_multihit_m_Fib[ifibcount]->Fill(i,m);  // multihit of a given clockTDC channel      
+      }
+
+      for (int i = 0; i < 16; ++i) 
+      {
+	auto s = spmt_num.at(i);
+	if(s > 0) fh_multihit_s_Fib[ifibcount]->Fill(i,s); // multihit of a given PADI channel
+      }
+    }
+
+
+    if(detHit) 
+    {
+      Int_t nHits = detHit->GetEntriesFast(); 
+
+      Double_t posfib = 0./0.;
+      Double_t totMax = 0.;     
+      Double_t tfib=0./0., tof_fib= 0./0.;
+      Double_t randx;
+      Int_t iFibmax = 0;
+
+      for (Int_t ihit = 0; ihit < nHits; ihit++)
+      {
+	Double_t tMAPMT = 0./0.;
+	Double_t tSPMT = 0./0.;
+
+	R3BBunchedFiberHitData* hit = (R3BBunchedFiberHitData*)detHit->At(ihit);
+	if (!hit) continue;
+
+	iFib = hit->GetFiberId();  // 1..
+
+	// times
+	tMAPMT = hit->GetMAPMTTime_ns();
+	tSPMT = hit->GetSPMTTime_ns();
+
+	dtime = tMAPMT-tSPMT;		
+
+	// "Push" two times in the same clock cycle:	
+		while(dtime < -1024) 
+		{
+			tSPMT = tSPMT - 2048.; 
+			dtime = tMAPMT - tSPMT;
+		}
+		while(dtime > 1024.) 
+		{
+			tSPMT = tSPMT + 2048.; 
+			dtime = tMAPMT - tSPMT;
+		}			
+
+	// "Push" the Fib times in the same cycle with LOS:
+	if(timeLos[0]>0. && !(IS_NAN(timeLos[0])))
+	{
+	  while(tMAPMT - timeLos[0] < 4096.)
+	  {
+	    tMAPMT = tMAPMT + 2048.*4.; 
+	    tSPMT = tSPMT + 2048.*4.; 		  
+	  }		
+	  while(tMAPMT - timeLos[0] > 4096.)
+	  {
+	    tMAPMT = tMAPMT - 2048.*4.; 
+	    tSPMT = tSPMT - 2048.*4.; 		  
+	  }
+	}
+
+	// Not-calibrated ToF:	 
+	//tfib = (tMAPMT + tSPMT) / 2.;
+	tfib = tSPMT;
+	if(tfib > 0. && !(IS_NAN(tfib)) && timeLos[0]>0. && !(IS_NAN(timeLos[0]))) tof_fib = tfib - timeLos[0];
+
+	// Not-calibrated position:  
+	randx = (std::rand() / (float)RAND_MAX);
+	if(iFib > 0) posfib = (-n_fiber[ifibcount]/2.+iFib+(0.5-randx)); 
+
+	if(hit->GetSPMTToT_ns() > 0) 
+	{
+	  fh_fibers_Fib[ifibcount]->Fill(iFib);  
+	  fh_ToT_s_Fib[ifibcount]->Fill(iFib,hit->GetSPMTToT_ns());
+	  fh_ToT_m_Fib[ifibcount]->Fill(iFib,hit->GetMAPMTToT_ns());
+	  fh_time_Fib[ifibcount]->Fill(iFib,tMAPMT-tSPMT);
+	  fh_Fib_ToF[ifibcount]->Fill(iFib,tof_fib);
+	  fh_Fib_pos[ifibcount]->Fill(posfib);	
+	  fh_Fib_vs_Events[ifibcount]->Fill(fNEvents,iFib);	
+	}  
+
+      }  // end for(ihit)
+
+      fh_mult_Fib[ifibcount]->Fill(nHits);            
+
+    }  // end if(aHit[ifibcount]) 
+
+
+  } // end for(ifibcount)
+
+  //----------------------------------------------------------------------
+  // TOFD
+  //----------------------------------------------------------------------
+
+  Int_t XPad[176]={0};
+  
+  if(fMappedItems.at(DET_TOFD))
+  {
+    auto det = fMappedItems.at(DET_TOFD);
+    Int_t nMapped = det->GetEntriesFast();
+    
+    Int_t NumPaddles[4]={0};
+    Int_t iPlaneMemm = 1, iBarMemm = 0;
+    
+    for (Int_t imapped = 0; imapped < nMapped; imapped++)     
+    {
+      auto mapped = (R3BTofdMappedData const *)det->At(imapped);
+      if (!mapped) continue; // should not happen
+
+      Int_t const iPlane = mapped->GetDetectorId(); // 1..n
+      Int_t const iBar   = mapped->GetBarId();   // 1..n
+      Int_t const iSide  = mapped->GetSideId();   // 1..n
+      Int_t const iEdge  = mapped->GetEdgeId(); 
+
+      if(iPlaneMemm != iPlane) iBarMemm = 0;
+      if(iPlane == 1 && iBarMemm != iBar && iSide == 1 && iEdge == 1) {NumPaddles[0] += 1;}
+      if(iPlane == 2 && iBarMemm != iBar && iSide == 1 && iEdge == 1) {NumPaddles[1] += 1;}
+      if(iPlane == 3 && iBarMemm != iBar && iSide == 1 && iEdge == 1) {NumPaddles[2] += 1;}
+      if(iPlane == 4 && iBarMemm != iBar && iSide == 1 && iEdge == 1) {NumPaddles[3] += 1;}
+
+      // cout<<imapped<<", "<<iPlane<<"; "<<iPlaneMem<<"; "<<iBar<<"; "<<iBarMem<<", "<<NumPaddles[iPlane-1]<<endl;
+      if (iPlane == 1) XPad[iBar]=1;
+      if (iPlane == 2) XPad[iBar+44]=1;
+      if (iPlane == 3) XPad[iBar+88]=1;
+      if (iPlane == 4) XPad[iBar+132]=1;
+      
+      iPlaneMemm = iPlane;
+      iBarMemm = iBar;
+      
+      if(iPlane<=fNofPlanes)
+      {
+	if(iSide==1) {fh_tofd_channels[iPlane-1]->Fill(-iBar-1);}
+	if(iSide==2) {fh_tofd_channels[iPlane-1]->Fill(iBar);}
+	
+      }
+    }
+  }
+
+  if(fCalItems.at(DET_TOFD))
+  {
+    auto det = fCalItems.at(DET_TOFD);
+    Int_t nCals = det->GetEntriesFast();
+    
+    Double_t tot1[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+    Double_t tot2[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+    Double_t t_paddle[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+    Double_t t1l[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+    Double_t t2l[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+    Double_t t1t[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+    Double_t t2t[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+    Double_t ToF[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={0./0.};
+
+    Bool_t Bar_present[10][N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD]={false};
+    
+    Int_t iBarMem = 0;
+    Int_t jmult[N_PLANE_MAX_TOFD][N_PADDLE_MAX_TOFD] = {0};
+
+    for (Int_t ical = 0; ical < nCals; ical++)     
+    {
+      auto cal = (R3BTofdCalData const *)det->At(ical);
+      if (!cal) continue; // should not happen
+
+      Int_t const iPlane  = cal->GetDetectorId();    // 1..n
+      Int_t const iBar  = cal->GetBarId();    // 1..n
+
+//      std::cout << iPlane << ' ' << iBar <<
+//          ',' << cal->GetTimeBL_ns() <<
+//          ' ' << cal->GetTimeBT_ns() <<
+//          ' ' << cal->GetTimeTL_ns() <<
+//          ' ' << cal->GetTimeTT_ns() << std::endl;
+
+      // get all times of one bar
+/*                       
+			 cout<<"TOFD Online: "<<fNEvents<<", "<<nCals<<"; "<<ical<<"; "<<iPlane<<", "<<iBar<<", "<<iBarMem<<", "<<", "<<
+			 cal->fTime1L_ns<<", "<<cal->fTime1T_ns<<", "<<
+			 cal->fTime2L_ns<<", "<<cal->fTime2T_ns<<endl;
+*/         
+/*
+      if(iBar != iBarMem ) 
+      {
+	jmult[iPlane-1][iBar-1] = 0;
+	if (!IS_NAN(cal->GetTimeBL_ns())) t1l[0][iPlane-1][iBar-1] = cal->GetTimeBL_ns();
+	if (!IS_NAN(cal->GetTimeBT_ns())) t1t[0][iPlane-1][iBar-1] = cal->GetTimeBT_ns();
+	if (!IS_NAN(cal->GetTimeTL_ns())) t2l[0][iPlane-1][iBar-1] = cal->GetTimeTL_ns();
+	if (!IS_NAN(cal->GetTimeTT_ns())) t2t[0][iPlane-1][iBar-1] = cal->GetTimeTT_ns();  
+	Bar_present[0][iPlane-1][iBar-1] = true;                        
+      }
+      else
+      {
+	jmult[iPlane-1][iBar-1] = jmult[iPlane-1][iBar-1] + 1;
+	Int_t jm = jmult[iPlane-1][iBar-1];
+	if (!IS_NAN(cal->GetTimeBL_ns())) t1l[jm][iPlane-1][iBar-1] = cal->GetTimeBL_ns();
+	if (!IS_NAN(cal->GetTimeBT_ns())) t1t[jm][iPlane-1][iBar-1] = cal->GetTimeBT_ns();
+	if (!IS_NAN(cal->GetTimeTL_ns())) t2l[jm][iPlane-1][iBar-1] = cal->GetTimeTL_ns();
+	if (!IS_NAN(cal->GetTimeTT_ns())) t2t[jm][iPlane-1][iBar-1] = cal->GetTimeTT_ns();
+	Bar_present[jm][iPlane-1][iBar-1] = true;
+      }
+      iBarMem = iBar;
+*/
+
+
+
+		Int_t jm = jmult[iPlane-1][iBar-1];
+		if (!IS_NAN(cal->GetTimeBL_ns())) t1l[jm][iPlane-1][iBar-1] = cal->GetTimeBL_ns();
+		if (!IS_NAN(cal->GetTimeBT_ns())) t1t[jm][iPlane-1][iBar-1] = cal->GetTimeBT_ns();
+		if (!IS_NAN(cal->GetTimeTL_ns())) t2l[jm][iPlane-1][iBar-1] = cal->GetTimeTL_ns();
+		if (!IS_NAN(cal->GetTimeTT_ns())) t2t[jm][iPlane-1][iBar-1] = cal->GetTimeTT_ns();
+		Bar_present[jm][iPlane-1][iBar-1] = true;
+		jmult[iPlane-1][iBar-1] = jmult[iPlane-1][iBar-1] + 1;
+
+    }
+
+    /*      		
+			for (Int_t ipl = 0; ipl < N_PLANE_MAX_TOFD; ipl++)
+			for(Int_t ibr = 0; ibr < N_PADDLE_MAX_TOFD; ibr++)
+			{
+			fh_tofd_multihit[ipl]->Fill(ibr+1,jmult[ipl][ibr]+1);
+			} 
+     */ 
+    for (Int_t ipl = 0; ipl < N_PLANE_MAX_TOFD; ipl++)
+      for(Int_t ibr = 0; ibr < N_PADDLE_MAX_TOFD; ibr++)
+	for(Int_t jm=0; jm < jmult[ipl][ibr]; jm++)
+	{  
+
+	  if(Bar_present[jm][ipl][ibr])
+	  {
+	    Int_t iPlane  = ipl+1;    // 1..n
+	    Int_t iBar  = ibr+1;    // 1..n
+
+	    fh_tofd_multihit[ipl]->Fill(ibr+1,jmult[ipl][ibr]);
+
+	    // calculate time over threshold and check if clock counter went out of range
+
+	    while(t1t[jm][iPlane-1][iBar-1] < t1l[jm][iPlane-1][iBar-1]) 
+	    {
+	      t1t[jm][iPlane-1][iBar-1] += 2048.*fClockFreq; 
+	    }
+
+	    while(t2t[jm][iPlane-1][iBar-1] < t2l[jm][iPlane-1][iBar-1]) 
+	    {
+	      t2t[jm][iPlane-1][iBar-1] += 2048.*fClockFreq; 
+	    }
+
+
+	    int ilc = jm; 
+
+	    if( !(IS_NAN(timeLos[ilc])) && timeLos[ilc]>0.)
+	    {
+
+			while(t1l[jm][iPlane-1][iBar-1] < timeLos[ilc])
+			{
+				t1t[jm][iPlane-1][iBar-1] += 2048.*fClockFreq;
+				t1l[jm][iPlane-1][iBar-1] += 2048.*fClockFreq;
+			}
+			while(t2l[jm][iPlane-1][iBar-1] < timeLos[ilc])
+			{
+				t2t[jm][iPlane-1][iBar-1] += 2048.*fClockFreq;
+				t2l[jm][iPlane-1][iBar-1] += 2048.*fClockFreq;
+			}
+	  
+		}
+	  
+		// ToF	  
+		t_paddle[jm][iPlane-1][iBar-1] = (t1l[jm][iPlane-1][iBar-1] + t2l[jm][iPlane-1][iBar-1])/2.;
+
+	    //  between 2 bars in 2 planes  
+		if(ipl > 0){
+			fh_tofd_dt[ipl-1]->Fill(iBar,t_paddle[jm][ipl][iBar-1]-t_paddle[jm][ipl-1][iBar-1]);
+		}		            
+
+	    if( !(IS_NAN(timeLos[ilc])) && timeLos[ilc]>0.)
+	    {
+			// between LOS and paddle          		            
+			ToF[jm][iPlane-1][iBar-1] = fmod(t_paddle[jm][iPlane-1][iBar-1] - timeLos[ilc] + 5*8192, 5*2048);
+			fh_tofd_ToF[iPlane-1]->Fill(iBar,ToF[jm][iPlane-1][iBar-1]);
+		}	    		   
+	    // ToT   
+	    tot1[jm][iPlane-1][iBar-1]=t1t[jm][iPlane-1][iBar-1] - t1l[jm][iPlane-1][iBar-1];		      
+	    if(tot1[jm][iPlane-1][iBar-1]<0) 
+	    {
+	      cout<<"Negative ToT "<<tot1[jm][iPlane-1]<<", for hit= "<<jm<<endl; 	
+	      cout<<"Times1: "<<t1t[jm][iPlane-1][iBar-1]<<" "<<t1l[jm][iPlane-1][iBar-1]<<endl; 		  
+	    }
+
+	    tot2[jm][iPlane-1][iBar-1]=t2t[jm][iPlane-1][iBar-1] - t2l[jm][iPlane-1][iBar-1];	
+	    if(tot2[jm][iPlane-1][iBar-1]<0) 
+	    {
+	      cout<<"Negative ToT "<<tot2[jm][iPlane-1][iBar-1]<<", for hit= "<<jm<<endl;               
+	      cout<<"Times2: "<<t2t[jm][iPlane-1][iBar-1]<<" "<<t2l[jm][iPlane-1][iBar-1]<<endl;		 
+	    }
+
+	    fh_tofd_TotPm[iPlane-1]->Fill(iBar,tot2[jm][iPlane-1][iBar-1]);
+	    fh_tofd_TotPm[iPlane-1]->Fill(-iBar-1,tot1[jm][iPlane-1][iBar-1]);
+
+	  }
+	}
+  }
+
+  //----------------------------------------------------------------------
+  // PTOF
+  //----------------------------------------------------------------------
+
+  if(fCalItems.at(DET_PTOF))
+  {
+    auto det = fCalItems.at(DET_PTOF);
+
+    Double_t tot1=0.;
+    Double_t tot2=0.;
+    Double_t t1l=0.;
+    Double_t t2l=0.;
+    Double_t t1t=0.;
+    Double_t t2t=0.;
+    Bool_t bar_quer1=false;
+    Bool_t bar_quer2=false;
+
+    Int_t nHits = det->GetEntriesFast();    
+    LOG(DEBUG) << "nHits: " << nHits << FairLogger::endl;
+    for (Int_t ihit = 0; ihit < nHits; ihit++)     {
+      R3BPaddleCalData *hit = (R3BPaddleCalData*)det->At(ihit);
+
+      if (!hit) continue; // should not happen
+
+      Int_t iBar  = hit->GetBar();    // 1..n
+      // get all times of one bar
+      t1l=hit->fTime1L_ns;
+      t2l=hit->fTime2L_ns;
+      t1t=hit->fTime1T_ns;
+      t2t=hit->fTime2T_ns;
+
+      if(!(t1l>0 && t2l>0 && t1t>0 && t2t>0)) continue;
+
+      fh_ptof_channels->Fill(iBar);
+      LOG(DEBUG) << "Bar: " << iBar << FairLogger::endl;
+      LOG(DEBUG) << "times PM1: " << t1l<<"  "<<t1t<<"  "<<t1t-t1l << FairLogger::endl;
+      LOG(DEBUG) << "times PM2: " << t2l<<"  "<<t2t<<"  "<<t2t-t2l << FairLogger::endl;
+      if(iBar==7) bar_quer1=true;
+      if(iBar==8) bar_quer2=true;
+
+      // calculate time over threshold and check if clock counter went out of range
+      while(t1t - t1l < 0.) {
+	t1t=t1t+2048.*fClockFreq; 
+      }
+
+      while(t2t-t2l < 0.) {
+	t2t=t2t+2048.*fClockFreq; 
+      }
+      while(t1l-timeLos[0]<0.){
+	t1t=t1t+2048.*fClockFreq; 
+	t1l=t1l+2048.*fClockFreq; 
+	t2t=t2t+2048.*fClockFreq; 
+	t2l=t2l+2048.*fClockFreq; 			  
+      }
+
+      tot1=t1t - t1l;		      
+      if(tot1<0) {
+	LOG(WARNING) << "Negative ToT "<< tot1<<FairLogger::endl;	
+	LOG(WARNING) << "times1: " << t1t << " " << t1l << FairLogger::endl;		  
+      }
+
+      tot2=t2t - t2l;	
+      if(tot2<0) {
+	LOG(WARNING) << "Negative ToT "<< tot2<<FairLogger::endl;              
+	LOG(WARNING) << "times2: " << t2t << " " << t2l << FairLogger::endl;		 
+      }
+
+      fh_ptof_TotPm1[iBar]->Fill(tot1);
+      fh_ptof_TotPm2[iBar]->Fill(tot2);
+      if(iBar==2) fh_ptof_test1->Fill(sqrt(tot1*tot1));	
+    }	
+
+    //once again
+
+    nHits = det->GetEntriesFast();    
+    //		LOG(DEBUG) << "nHits: " << nHits << FairLogger::endl;
+    for (Int_t ihit = 0; ihit < nHits; ihit++){
+      R3BPaddleCalData *hit = (R3BPaddleCalData*)det->At(ihit);
+
+      if (!hit) continue; // should not happen
+
+      Int_t iBar  = hit->GetBar();    // 1..n
+      // get all times of one bar
+      t1l=hit->fTime1L_ns;
+      t2l=hit->fTime2L_ns;
+      t1t=hit->fTime1T_ns;
+      t2t=hit->fTime2T_ns;
+
+      if(!(t1l>0 && t2l>0 && t1t>0 && t2t>0)) continue;
+
+      // calculate time over threshold and check if clock counter went out of range
+      while(t1t - t1l < 0.) {
+	t1t=t1t+2048.*fClockFreq; 
+      }
+
+      while(t2t-t2l < 0.) {
+	t2t=t2t+2048.*fClockFreq; 
+      }
+      while(t1l-timeLos[0]<0.){
+	t1t=t1t+2048.*fClockFreq; 
+	t1l=t1l+2048.*fClockFreq; 
+	t2t=t2t+2048.*fClockFreq; 
+	t2l=t2l+2048.*fClockFreq; 			  
+      }
+
+      tot1=t1t - t1l;		      
+      if(tot1<0) {
+	LOG(WARNING) << "Negative ToT "<< tot1<<FairLogger::endl;	
+	LOG(WARNING) << "times1: " << t1t << " " << t1l << FairLogger::endl;		  
+      }
+
+      tot2=t2t - t2l;	
+      if(tot2<0) {
+	LOG(WARNING) << "Negative ToT "<< tot2<<FairLogger::endl;              
+	LOG(WARNING) << "times2: " << t2t << " " << t2l << FairLogger::endl;		 
+      }
+
+      if(bar_quer1 && bar_quer2){
+	//				fh_ptof_TotPm1[iBar]->Fill(tot1);
+	//				fh_ptof_TotPm2[iBar]->Fill(tot2);
+	//				if(iBar==2) fh_ptof_test2->Fill(sqrt(tot1*tot2));	
+	fh_ptof_channels_cut->Fill(iBar);			
+      }			
+    }
+  }
+
+    //----------------------------------------------------------------------
+    // PSPX
+    //----------------------------------------------------------------------
+  UInt_t pspx0_m1_ch;
+  if (fMappedItems.at(DET_PSPX))
+    {
+        UInt_t mult_x[N_PSPX];
+        UInt_t mult_y[N_PSPX];
+
+        UInt_t channel_x[N_PSPX][N_STRIPS_PSPX * 2];
+        UInt_t channel_y[N_PSPX][N_STRIPS_PSPX * 2];
+
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            mult_x[i] = 0;
+            mult_y[i] = 0;
+
+            for (UInt_t j = 0; j < N_STRIPS_PSPX * 2; j++)
+            {
+                channel_x[i][j] = 0;
+                channel_y[i][j] = 0;
+            }
+        }
+
+        Int_t nHits = fMappedItems.at(DET_PSPX)->GetEntriesFast();
+
+        for (Int_t ihit = 0; ihit < nHits; ihit++)
+        {
+            R3BPspxMappedData* mappedData = (R3BPspxMappedData*)fMappedItems.at(DET_PSPX)->At(ihit);
+            UInt_t i = mappedData->GetDetector() - 1;
+                if (mappedData->GetChannel() > N_STRIPS_PSPX * 2 &&
+                    mappedData->GetChannel() < N_STRIPS_PSPX * 4 + 1)
+                {
+                    // LOG(INFO) << "Test1 " << i << " " << mappedData->GetDetector() << " " <<
+                    // mappedData->GetChannel()<< FairLogger::endl;
+                    channel_y[i][mult_y[i]] = mappedData->GetChannel();
+                    mult_y[i]++;
+                }
+                else if (mappedData->GetChannel() > 0 &&
+                         mappedData->GetChannel() < N_STRIPS_PSPX * 2 + 1)
+                {
+                    // LOG(INFO) << "Test2 " << i << " " << mappedData->GetDetector() << " " <<
+                    // mappedData->GetChannel()<< FairLogger::endl;
+                    channel_x[i][mult_x[i]] = mappedData->GetChannel();
+                    mult_x[i]++;
+                }
+            
+        }
+	//Ashton code for Sfib correlations
+	if (mult_x[0] == 1){
+	 pspx0_m1_ch = channel_x[0][0];
+	}
+
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            // LOG(INFO) << "Test3 " << i << " " << mult_x[i] << " " << mult_y[i] << FairLogger::endl;
+            fh_pspx_multiplicity_x[i]->Fill(mult_x[i]);
+            fh_pspx_multiplicity_y[i]->Fill(mult_y[i]);
+            // LOG(INFO) << "Test4 " << fh_pspx_multiplicity_x[i]->GetBinContent(1) << FairLogger::endl;
+
+	std:: vector<int> v_ch_x, v_ch_y;
+          for(Int_t j = 0; j < mult_x[i]; j++){
+            if ((channel_x[i][j] + 1)/2 == (channel_x[i][j+1] + 1)/2)
+            {
+			v_ch_x.push_back((channel_x[i][j]+1)/2);
+            }
+	   }
+	  for(Int_t j = 0; j < mult_y[i]; j++){
+            if ((channel_y[i][j] + 1)/2 == (channel_y[i][j+1] + 1)/2)
+            {
+			v_ch_y.push_back((channel_y[i][j]+1)/2);
+            }
+	   }
+	   for (auto it_x = v_ch_x.begin(); v_ch_x.end() != it_x; ++it_x)
+	   {
+	     for (auto it_y = v_ch_y.begin(); v_ch_y.end() != it_y; ++it_y)
+	     {
+	                   fh_pspx_strips_position[i]->Fill(*it_x,
+                                                 -*it_y + 3 * N_STRIPS_PSPX +
+                                                     1); // with inverted axis to account for orientation
+                // fh_pspx_strips_position[i]->Fill((channel_x[i][0] + 1) / 2, ((channel_y[i][0] + 1) / 2)); //without
+                // inverted axis => wrong orientation y axis
+                }
+                }
+                
+                //std::cout << "x: " << mult_x[i] << ", " << (channel_x[i][0]+1)/2 << endl;
+                //std::cout << "y: " << mult_y[i] << ", " << -((int)channel_y[i][0]+1)/2 + 3 * N_STRIPS_PSPX + 1<< endl;
+                
+            for (Int_t j = 0; j < mult_x[i]; j++)
+            {
+                fh_pspx_channel_x[i]->Fill(channel_x[i][j]);
+            }
+
+            for (Int_t j = 0; j < mult_y[i]; j++)
+            {
+                fh_pspx_channel_y[i]->Fill(channel_y[i][j]);
+            }
+        }
+    }
+
+    if (fCalItems.at(DET_PSPX))
+    {
+        Int_t energy_front[N_PSPX];
+        Int_t energy_back[N_PSPX];
+
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            energy_front[i] = 0;
+            energy_back[i] = 0;
+        }
+
+        Int_t nHits = fCalItems.at(DET_PSPX)->GetEntriesFast();
+
+        for (Int_t ihit = 0; ihit < nHits; ihit++)
+        {
+            for (UInt_t i = 0; i < N_PSPX; i++)
+            {
+                R3BPspxCalData* calData = (R3BPspxCalData*)fCalItems.at(DET_PSPX)->At(ihit);
+                if (calData->GetDetector() == i + 1 && calData->GetStrip() > N_STRIPS_PSPX &&
+                    calData->GetStrip() < N_STRIPS_PSPX * 2 + 1)
+                {
+                    energy_back[i] += (calData->GetEnergy1() + calData->GetEnergy2());
+                }
+                else if (calData->GetDetector() == i + 1 && calData->GetStrip() > 0 &&
+                         calData->GetStrip() < N_STRIPS_PSPX + 1)
+                {
+                    energy_front[i] += (calData->GetEnergy1() + calData->GetEnergy2());
+                }
+            }
+        }
+
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            // LOG(INFO) << "Test " << i << " " << energy_front[i] << " " << energy_back[i] << FairLogger::endl;
+          if (i !=2 && i !=3)
+          {
+            fh_pspx_cal_energy_frontback[i]->Fill(energy_front[i], energy_back[i]);
+          }
+          else
+          {
+            fh_pspx_cal_energy_frontback[i]->Fill(-energy_front[i], -energy_back[i]); //s444: psp 2 is read out with Munich cards, inverts polarity
+          }
+        }
+    }
+
+    if (fHitItems.at(DET_PSPX))
+    {
+        Int_t nHits = fHitItems.at(DET_PSPX)->GetEntriesFast();
+
+        for (Int_t ihit = 0; ihit < nHits; ihit++)
+        {
+            for (UInt_t i = 0; i < (N_PSPX + 1) / 2; i++)
+            {
+                R3BPspxHitData* hitData = (R3BPspxHitData*)fHitItems.at(DET_PSPX)->At(ihit);
+
+                if (hitData->GetDetector() == i * 2 + 1)
+                {
+                    fh_pspx_hit_energy[i]->Fill(hitData->GetEnergy());
+                    fh_pspx_hit_position[i]->Fill(hitData->GetX(), hitData->GetY());
+                }
+            }
+        }
+    }
+  //----------------------------------------------------------------------
+  // Sipm Fiber
+  //----------------------------------------------------------------------
+  
+  //Double_t sfib_tot[2]={-100};//sfib_tot[i],i=0(top),1(bot)
+  //Double_t sfib_tot_max[2][5]={-100};//sfib_tot_ch[i][j], i=0(top),1(bot),j=1st,2nd,3rd.. largest TOT value
+  //Int_t sfib_tot_ch[2][5]={-100}; //sfib_tot_ch[i][j], i=0(top),1(bot),j=1st,2nd,3rd.. largest channel
+  if(fMappedItems.at(DET_SFIB))
+  {
+    uint32_t lt[2][256][4];
+    memset(lt, 0, sizeof lt);
+    char mask[256];
+    memset(mask, 0, sizeof mask);
+    
+    auto det = fMappedItems.at(DET_SFIB);
+    Int_t nMapped = det->GetEntriesFast();    
+    for (Int_t imapped = 0; imapped < nMapped; imapped++)     
+    {
+      auto mapped = (R3BSfibMappedData const *)det->At(imapped);
+      if (!mapped)
+	{
+	  continue; // should not happen
+	}
+      auto &lt_this = lt[mapped->IsTop() ? 0 : 1][mapped->GetChannel() - 1];
+      lt_this[mapped->IsLeading() ? 0 : 1] = mapped->GetCoarse();
+      lt_this[mapped->IsLeading() ? 2 : 3] = mapped->GetFine();
+
+      mask[mapped->GetChannel() - 1] |= mapped->IsTop() ? 1 : 2;
+    }
+    Int_t fib_mult=0;
+    Int_t fib_mult_g=0;
+    Int_t fib_fired[256]={0};
+    Int_t fib_fired_g[256]={0};
+    
+    Double_t sfib_tot[2]={-100};//sfib_tot[i],i=0(top),1(bot)
+    Double_t sfib_tot_max[2][5]={-100};//sfib_tot_ch[i][j], i=0(top),1(bot),j=1st,2nd,3rd.. largest TOT value
+    Int_t sfib_tot_ch[2][5]={-100}; //sfib_tot_ch[i][j], i=0(top),1(bot),j=1st,2nd,3rd.. largest channel
+    
+    //std::ofstream run202("run202.txt",std::ios::app);
+    //run202 << fNEvents;
+    for (int ch = 0; ch < 256; ++ch)
+      {
+	sfib_tot[0]=(12 * lt[0][ch][1] + lt[0][ch][3]) - (12 * lt[0][ch][0] + lt[0][ch][2]); //[0] for top 
+	sfib_tot[1]=(12 * lt[1][ch][1] + lt[1][ch][3]) - (12 * lt[1][ch][0] + lt[1][ch][2]); //[1] for bot
+	//
+	// Top
+	//
+	if ((sfib_tot[0]>sfib_tot_max[0][1])&&(sfib_tot[0]<4000))
+	  {
+	    // sfib_tot_max[0][6]=sfib_tot_max[0][5];
+	    sfib_tot_max[0][5]=sfib_tot_max[0][4];
+	    sfib_tot_max[0][4]=sfib_tot_max[0][3];
+	    sfib_tot_max[0][3]=sfib_tot_max[0][2];
+	    sfib_tot_max[0][2]=sfib_tot_max[0][1];
+	    sfib_tot_max[0][1]=sfib_tot[0];
+	    //sfib_tot_ch[0][6]=sfib_tot_ch[0][5];
+	    sfib_tot_ch[0][5]=sfib_tot_ch[0][4];
+	    sfib_tot_ch[0][4]=sfib_tot_ch[0][3];
+	    sfib_tot_ch[0][3]=sfib_tot_ch[0][2];
+	    sfib_tot_ch[0][2]=sfib_tot_ch[0][1];
+	    sfib_tot_ch[0][1]=ch;
+	  }
+	else if((sfib_tot[0]>sfib_tot_max[0][2])&&(sfib_tot[0]<4000))
+	  {
+	    //sfib_tot_max[0][6]=sfib_tot_max[0][5];
+	    sfib_tot_max[0][5]=sfib_tot_max[0][4];
+	    sfib_tot_max[0][4]=sfib_tot_max[0][3];
+	    sfib_tot_max[0][3]=sfib_tot_max[0][2];
+	    sfib_tot_max[0][2]=sfib_tot[0];
+	    sfib_tot_max[0][1]=sfib_tot_max[0][1];
+	    //sfib_tot_ch[0][6]=sfib_tot_ch[0][5];
+     	    sfib_tot_ch[0][5]=sfib_tot_ch[0][4];
+	    sfib_tot_ch[0][4]=sfib_tot_ch[0][3];
+	    sfib_tot_ch[0][3]=sfib_tot_ch[0][2];
+	    sfib_tot_ch[0][2]=ch;
+	    sfib_tot_ch[0][1]=sfib_tot_ch[0][1];
+	  }
+	else if((sfib_tot[0]>sfib_tot_max[0][3])&&(sfib_tot[0]<4000))
+	  {
+	    //sfib_tot_max[0][6]=sfib_tot_max[0][5];
+	    sfib_tot_max[0][5]=sfib_tot_max[0][4];
+	    sfib_tot_max[0][4]=sfib_tot_max[0][3];
+	    sfib_tot_max[0][3]=sfib_tot[0];
+	    sfib_tot_max[0][2]=sfib_tot_max[0][2];
+	    sfib_tot_max[0][1]=sfib_tot_max[0][1];
+	    //sfib_tot_ch[0][6]=sfib_tot_ch[0][5];
+	    sfib_tot_ch[0][5]=sfib_tot_ch[0][4];
+	    sfib_tot_ch[0][4]=sfib_tot_ch[0][3];
+	    sfib_tot_ch[0][3]=ch;
+	    sfib_tot_ch[0][2]=sfib_tot_ch[0][2];
+	    sfib_tot_ch[0][1]=sfib_tot_ch[0][1];
+	  }
+	else if((sfib_tot[0]>sfib_tot_max[0][4])&&(sfib_tot[0]<4000))
+	  {
+	    //sfib_tot_max[0][6]=sfib_tot_max[0][5];
+	    sfib_tot_max[0][5]=sfib_tot_max[0][4];
+	    sfib_tot_max[0][4]=sfib_tot[0];
+	    sfib_tot_max[0][3]=sfib_tot_max[0][3];
+	    sfib_tot_max[0][2]=sfib_tot_max[0][2];
+	    sfib_tot_max[0][1]=sfib_tot_max[0][1];
+	    //sfib_tot_ch[0][6]=sfib_tot_ch[0][5];
+	    sfib_tot_ch[0][5]=sfib_tot_ch[0][4];
+	    sfib_tot_ch[0][4]=ch;
+	    sfib_tot_ch[0][3]=sfib_tot_ch[0][3];
+	    sfib_tot_ch[0][2]=sfib_tot_ch[0][2];
+	    sfib_tot_ch[0][1]=sfib_tot_ch[0][1];
+	  }
+	else if((sfib_tot[0]>sfib_tot_max[0][5])&&(sfib_tot[0]<4000))
+	  {
+	    //sfib_tot_max[0][6]=sfib_tot_max[0][5];
+	    sfib_tot_max[0][5]=sfib_tot[0];
+	    sfib_tot_max[0][4]=sfib_tot_max[0][4];
+	    sfib_tot_max[0][3]=sfib_tot_max[0][3];
+	    sfib_tot_max[0][2]=sfib_tot_max[0][2];
+	    sfib_tot_max[0][1]=sfib_tot_max[0][1];
+	    //sfib_tot_ch[0][6]=sfib_tot_ch[0][5];
+	    sfib_tot_ch[0][5]=ch;
+	    sfib_tot_ch[0][4]=sfib_tot_ch[0][4];
+	    sfib_tot_ch[0][3]=sfib_tot_ch[0][3];
+	    sfib_tot_ch[0][2]=sfib_tot_ch[0][2];
+	    sfib_tot_ch[0][1]=sfib_tot_ch[0][1];
+	  }
+	//else if((sfib_tot[0]>sfib_tot_max[0][6])&&(sfib_tot[0]<4000))
+	//{
+	//  sfib_tot_max[0][6]=sfib_tot[0];
+	//  sfib_tot_max[0][5]=sfib_tot_max[0][5];
+	//  sfib_tot_max[0][4]=sfib_tot_max[0][4];
+	//  sfib_tot_max[0][3]=sfib_tot_max[0][3];
+	//  sfib_tot_max[0][2]=sfib_tot_max[0][2];
+	//  sfib_tot_max[0][1]=sfib_tot_max[0][1];
+	//  sfib_tot_ch[0][6]=ch;
+	//  sfib_tot_ch[0][5]=sfib_tot_ch[0][5];
+	//  sfib_tot_ch[0][4]=sfib_tot_ch[0][4];
+	//  sfib_tot_ch[0][3]=sfib_tot_ch[0][3];
+	//  sfib_tot_ch[0][2]=sfib_tot_ch[0][2];
+	//  sfib_tot_ch[0][1]=sfib_tot_ch[0][1];
+	//}
+	else
+	  {
+	    //sfib_tot_max[0][6]=sfib_tot_max[0][6];
+	    sfib_tot_max[0][5]=sfib_tot_max[0][5];
+	    sfib_tot_max[0][4]=sfib_tot_max[0][4];
+	    sfib_tot_max[0][3]=sfib_tot_max[0][3];
+	    sfib_tot_max[0][2]=sfib_tot_max[0][2];
+	    sfib_tot_max[0][1]=sfib_tot_max[0][1];
+	    //sfib_tot_ch[0][6]=sfib_tot_ch[0][6];
+	    sfib_tot_ch[0][5]=sfib_tot_ch[0][5];
+	    sfib_tot_ch[0][4]=sfib_tot_ch[0][4];
+	    sfib_tot_ch[0][3]=sfib_tot_ch[0][3];
+	    sfib_tot_ch[0][2]=sfib_tot_ch[0][2];
+	    sfib_tot_ch[0][1]=sfib_tot_ch[0][1];
+	  }
+	//
+	// Bottom
+	//
+	if ((sfib_tot[1]>sfib_tot_max[1][1])&&(sfib_tot[1]<4000))
+	  {
+	    //sfib_tot_max[1][6]=sfib_tot_max[1][5];
+	    sfib_tot_max[1][5]=sfib_tot_max[1][4];
+	    sfib_tot_max[1][4]=sfib_tot_max[1][3];
+	    sfib_tot_max[1][3]=sfib_tot_max[1][2];
+	    sfib_tot_max[1][2]=sfib_tot_max[1][1];
+	    sfib_tot_max[1][1]=sfib_tot[1];
+	    //sfib_tot_ch[1][6]=sfib_tot_ch[1][5];
+	    sfib_tot_ch[1][5]=sfib_tot_ch[1][4];
+	    sfib_tot_ch[1][4]=sfib_tot_ch[1][3];
+	    sfib_tot_ch[1][3]=sfib_tot_ch[1][2];
+	    sfib_tot_ch[1][2]=sfib_tot_ch[1][1];
+	    sfib_tot_ch[1][1]=ch;
+	  }
+	else if((sfib_tot[1]>sfib_tot_max[1][2])&&(sfib_tot[1]<4000))
+	  {
+	    //sfib_tot_max[1][6]=sfib_tot_max[1][5];
+	    sfib_tot_max[1][5]=sfib_tot_max[1][4];
+	    sfib_tot_max[1][4]=sfib_tot_max[1][3];
+	    sfib_tot_max[1][3]=sfib_tot_max[1][2];
+	    sfib_tot_max[1][2]=sfib_tot[1];
+	    sfib_tot_max[1][1]=sfib_tot_max[1][1];
+	    //sfib_tot_ch[1][6]=sfib_tot_ch[1][5];
+	    sfib_tot_ch[1][5]=sfib_tot_ch[1][4];
+	    sfib_tot_ch[1][4]=sfib_tot_ch[1][3];
+	    sfib_tot_ch[1][3]=sfib_tot_ch[1][2];
+	    sfib_tot_ch[1][2]=ch;
+	    sfib_tot_ch[1][1]=sfib_tot_ch[1][1];
+	  }
+	else if((sfib_tot[1]>sfib_tot_max[1][3])&&(sfib_tot[1]<4000))
+	  {
+	    //sfib_tot_max[1][6]=sfib_tot_max[1][5];
+	    sfib_tot_max[1][5]=sfib_tot_max[1][4];
+	    sfib_tot_max[1][4]=sfib_tot_max[1][3];
+	    sfib_tot_max[1][3]=sfib_tot[1];
+	    sfib_tot_max[1][2]=sfib_tot_max[1][2];
+	    sfib_tot_max[1][1]=sfib_tot_max[1][1];
+	    //sfib_tot_ch[1][6]=sfib_tot_ch[1][5];
+	    sfib_tot_ch[1][5]=sfib_tot_ch[1][4];
+	    sfib_tot_ch[1][4]=sfib_tot_ch[1][3];
+	    sfib_tot_ch[1][3]=ch;
+	    sfib_tot_ch[1][2]=sfib_tot_ch[1][2];
+	    sfib_tot_ch[1][1]=sfib_tot_ch[1][1];
+	  }
+	else if((sfib_tot[1]>sfib_tot_max[1][4])&&(sfib_tot[1]<4000))
+	  {
+	    //sfib_tot_max[1][6]=sfib_tot_max[1][5];
+	    sfib_tot_max[1][5]=sfib_tot_max[1][4];
+	    sfib_tot_max[1][4]=sfib_tot[1];
+	    sfib_tot_max[1][3]=sfib_tot_max[1][3];
+	    sfib_tot_max[1][2]=sfib_tot_max[1][2];
+	    sfib_tot_max[1][1]=sfib_tot_max[1][1];
+	    //sfib_tot_ch[1][6]=sfib_tot_ch[1][5];
+	    sfib_tot_ch[1][5]=sfib_tot_ch[1][4];
+	    sfib_tot_ch[1][4]=ch;
+	    sfib_tot_ch[1][3]=sfib_tot_ch[1][3];
+	    sfib_tot_ch[1][2]=sfib_tot_ch[1][2];
+	    sfib_tot_ch[1][1]=sfib_tot_ch[1][1];
+	  }
+	else if((sfib_tot[1]>sfib_tot_max[1][5])&&(sfib_tot[1]<4000))
+	  {
+	    //sfib_tot_max[1][6]=sfib_tot_max[1][5];
+	    sfib_tot_max[1][5]=sfib_tot[1];
+	    sfib_tot_max[1][4]=sfib_tot_max[1][4];
+	    sfib_tot_max[1][3]=sfib_tot_max[1][3];
+	    sfib_tot_max[1][2]=sfib_tot_max[1][2];
+	    sfib_tot_max[1][1]=sfib_tot_max[1][1];
+	    //sfib_tot_ch[1][6]=sfib_tot_ch[1][5];
+	    sfib_tot_ch[1][5]=ch;
+	    sfib_tot_ch[1][4]=sfib_tot_ch[1][4];
+	    sfib_tot_ch[1][3]=sfib_tot_ch[1][3];
+	    sfib_tot_ch[1][2]=sfib_tot_ch[1][2];
+	    sfib_tot_ch[1][1]=sfib_tot_ch[1][1];
+	  }
+	//else if((sfib_tot[1]>sfib_tot_max[1][6])&&(sfib_tot[1]<4000))
+	//{
+	//  sfib_tot_max[1][6]=sfib_tot[1];
+	//  sfib_tot_max[1][5]=sfib_tot_max[1][5];
+	//  sfib_tot_max[1][4]=sfib_tot_max[1][4];
+	//  sfib_tot_max[1][3]=sfib_tot_max[1][3];
+	//  sfib_tot_max[1][2]=sfib_tot_max[1][2];
+	//  sfib_tot_max[1][1]=sfib_tot_max[1][1];
+	//  sfib_tot_ch[1][6]=ch;
+	//  sfib_tot_ch[1][5]=sfib_tot_ch[1][5];
+	//  sfib_tot_ch[1][4]=sfib_tot_ch[1][4];
+	//  sfib_tot_ch[1][3]=sfib_tot_ch[1][3];
+	//  sfib_tot_ch[1][2]=sfib_tot_ch[1][2];
+	//  sfib_tot_ch[1][1]=sfib_tot_ch[1][1];
+	//}
+	else
+	  {
+	    //sfib_tot_max[1][6]=sfib_tot_max[1][6];
+	    sfib_tot_max[1][5]=sfib_tot_max[1][5];
+	    sfib_tot_max[1][4]=sfib_tot_max[1][4];
+	    sfib_tot_max[1][3]=sfib_tot_max[1][3];
+	    sfib_tot_max[1][2]=sfib_tot_max[1][2];
+	    sfib_tot_max[1][1]=sfib_tot_max[1][1];
+	    //sfib_tot_ch[1][6]=sfib_tot_ch[1][6];
+	    sfib_tot_ch[1][5]=sfib_tot_ch[1][5];
+	    sfib_tot_ch[1][4]=sfib_tot_ch[1][4];
+	    sfib_tot_ch[1][3]=sfib_tot_ch[1][3];
+	    sfib_tot_ch[1][2]=sfib_tot_ch[1][2];
+	    sfib_tot_ch[1][1]=sfib_tot_ch[1][1];
+	  }
+	/*if (ch>-1&&ch<256&&(sfib_tot[0]>0||sfib_tot[1]>0))
+	  {
+	    cout << fNEvents;
+	    cout << " ";
+	    cout << " TOP= ";
+	    cout << ch;
+	    cout << " TOT= ";
+	    cout << sfib_tot[0]; //Top
+	    cout << " ";
+	    cout << (12 * lt[0][ch][1] + lt[0][ch][3]); //Leading
+	    cout << " ";
+	    cout << (12 * lt[0][ch][0] + lt[0][ch][2]); //Trailing
+	    cout << "\n";
+	    }*/
+	//run202 << "Writing this to a file.\n"<<endl;
+	if (ch>-1&&ch<256&&((sfib_tot[0]>0&&sfib_tot[0]<10000)||(sfib_tot[1]>0&&sfib_tot[1]<10000)))
+       //if (ch>-1&&ch<256&&sfib_tot[0]>0);
+	  //ASCII
+	{
+	  //	string someString("This is a string.");
+	  //	printf("%s\n", someString);
+	  //
+	  //run202 << " TOP ";
+	  //run202 << ch;
+	  //run202 << " ";
+	  //run202 << sfib_tot[0]; //Top
+	  /* run202 << " ";
+	  run202 << (12 * lt[0][ch][1] + lt[0][ch][3]); //Leading
+	  run202 << " ";
+6yes0	  run202 << (12 * lt[0][ch][0] + lt[0][ch][2]); //Trailing0
+	  run202 << " ";*/
+	  //run202.close(); 
+	  //	  return 0;
+	  //}
+	  //	if (ch>-1&&ch<256&&sfib_tot[1]>0);
+	//ASCII
+	//{
+	  //std::ofstream run202("run202.txt",std::ios::app);
+	  //run202 << " Bottom ";
+	  //run202 << ch+1000;
+	  //run202 << " ";
+	  //run202 << sfib_tot[1]; //Bottom
+	  /*run202 << " ";
+	  run202 << (12 * lt[1][ch][1] + lt[1][ch][3]); //Leading
+	  run202 << " ";
+	  run202 << (12 * lt[1][ch][0] + lt[1][ch][2]); //Trailing*/
+	  //run202 << " ";
+	  //run202 << /n<< std::endl;
+	  //return 0;
+	  //run202.close(); 
+	  }
+	if (lt[0][ch][0]&&lt[1][ch][0])
+	  {
+	    fh_sfib_tot_tvb->Fill(sfib_tot[1],sfib_tot[0]);
+	  }
+	if (lt[0][ch][0])
+	  {
+	    fh_sfib_channels_top->Fill(ch);
+	    fh_sfib_Tot_top->Fill(ch, sfib_tot[0]);
+	    fh_sfib_Tot_top1d->Fill(sfib_tot[0]);
+	    //	    cout << " ";
+	    //	    cout << fh_sfib_Tot_top1d->Fill(sfib_tot[0]); //Top
+	    for (int ch1 = 0; ch1<256;ch1++)
+	      {
+		if (lt[1][ch1][0]) {
+		  fh_sfib_channels_topvsbot->Fill(ch,ch1);
+		  if (ch/8 == ch1/8){
+		    fh_sfib_pspx->Fill(ch,pspx0_m1_ch); 
+		      }	  
+		}
+	      }
+	    if (sfib_tot[1]>100)
+	      {
+		fh_sfib_Tot_top_g->Fill(ch, sfib_tot[0]);
+ 		fh_sfib_Tot_top1d_g->Fill(sfib_tot[0]);
+	      }
+          }
+	if (lt[1][ch][0])
+	  {
+	    fh_sfib_channels_bot->Fill(ch);
+	    fh_sfib_Tot_bot->Fill(ch, sfib_tot[1]);
+	    fh_sfib_Tot_bot1d->Fill(sfib_tot[1]);
+	    if(sfib_tot[0]>100)
+	      {
+		fh_sfib_Tot_bot_g->Fill(ch, sfib_tot[1]);
+		fh_sfib_Tot_bot1d_g->Fill(sfib_tot[1]);
+	      }
+	  }
+	//multiplicity analysis for any connection of SiPM
+	if (3 == mask[ch]) {
+	  fh_sfib_channels->Fill(ch);
+	  fib_mult++;
+	  fib_fired[ch]=1;
+	  if((sfib_tot[1]>100)&&(sfib_tot[0]>100))
+	    {
+	      fib_mult_g++;
+	      fib_fired_g[ch]=1;
+	      fh_sfib_channels_g->Fill(ch);
+	      for (int ibar=0;ibar<176;ibar++)
+	        {
+		  if (XPad[ibar]==1) fh_sfib_tofd->Fill(ch,ibar);
+		}
+	    }
+	}
+      if (fib_mult>0)
+	{
+	  fh_sfib_fmult->Fill(fib_mult);
+	  if (fib_mult_g>0) fh_sfib_fmult_g->Fill(fib_mult_g);
+	  Int_t fib_cluster_mult=fib_mult; 
+	  Int_t fib_cluster_mult_g=fib_mult_g;
+	  for (int i=0;i<256;i++)
+	    {
+	      if (fib_fired[i]!=1) continue;
+	      if (i<255&&fib_fired[i+1]==1)
+		{
+		  fib_cluster_mult--;
+		  if (i<255&&fib_fired_g[i]==1&&fib_fired_g[i+1]==1) fib_cluster_mult_g--;
+		}
+	    }
+	  fh_sfib_cmult->Fill(fib_cluster_mult);
+	  if (fib_mult_g>0) fh_sfib_cmult_g->Fill(fib_cluster_mult_g);
+	}
+      }
+    //run202<<std::endl; 
+    //run202.close();
+    //2019.03.12 multiplicity upto 3 J.Tanaka
+    Int_t sfib_multi=0;
+    //mapping of fired fiber 2019.03.12 J.Tanaka
+    Int_t sfib_fired[5]={-100}; //sfib_fired[multiplicity]
+    Int_t sfib_map[256][256]={-100};//convert from Sipm number on top 256 times bot 256 to fiber number 4096. sfib_map[top][bot]
+    Double_t sfib_multi_tot[2][5]={-100};
+    Double_t sfib_tot_fired[2][2048]={-100};
+    Int_t sfib_multi_ch[2][256]={-100};
+    //Double_t sfib_multi_clus_tot[2][5]={-100};
+    //Double_t sfib_multi_clus_fired[2][2048]={-100};
+      
+
+    //attaching the fiber mapping file
+      
+    ifstream f("/u/afalduto/sfib_map_forward.txt");
+    f.ignore( numeric_limits<streamsize>::max(),'\n');
+    unsigned top_ch, bot_ch, fiber_no;
+    /*
+    while (f) {
+      f >> top_ch >> bot_ch >> fiber_no;
+      sfib_map[top_ch][bot_ch]=fiber_no;
+    }
+    */
+    if((sfib_tot_ch[0][1]/8==sfib_tot_ch[1][1]/8)&&sfib_tot_ch[0][1]>0&&sfib_tot_ch[0][1]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][1]][sfib_tot_ch[1][1]]; //fiber ID
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][1];          //TOT for fired fiber top
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][1];          //TOT for fired fiber bot
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][1];                        //SiPM ID for top
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][1];                      //TOT for SiPM top
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][1];                        //SiPM ID for bot
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][1];                      //TOT for SiPM bot
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][1]/8==sfib_tot_ch[1][2]/8)&&sfib_tot_ch[0][1]>0&&sfib_tot_ch[1][2]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][1]][sfib_tot_ch[1][2]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][1];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][2];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][1];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][1];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][2];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][2];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][2]/8==sfib_tot_ch[1][1]/8)&&sfib_tot_ch[0][2]>0&&sfib_tot_ch[1][1]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][2]][sfib_tot_ch[1][1]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][2];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][1];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][2];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][2];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][1];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][1];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][2]/8==sfib_tot_ch[1][2]/8)&&sfib_tot_ch[0][2]>0&&sfib_tot_ch[1][2]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][2]][sfib_tot_ch[1][2]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][2];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][2];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][2];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][2];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][2];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][2];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][1]/8==sfib_tot_ch[1][3]/8)&&sfib_tot_ch[0][1]>0&&sfib_tot_ch[1][3]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][1]][sfib_tot_ch[1][3]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][1];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][3];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][1];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][1];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][3];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][3];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][3]/8==sfib_tot_ch[1][1]/8)&&sfib_tot_ch[0][3]>0&&sfib_tot_ch[1][1]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][3]][sfib_tot_ch[1][1]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][3];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][1];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][3];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][3];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][1];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][1];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][2]/8==sfib_tot_ch[1][3]/8)&&sfib_tot_ch[0][2]>0&&sfib_tot_ch[1][3]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][2]][sfib_tot_ch[1][3]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][2];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][3];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][2];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][2];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][3];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][3];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][3]/8==sfib_tot_ch[1][3]/8)&&sfib_tot_ch[0][3]>0&&sfib_tot_ch[1][3]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][3]][sfib_tot_ch[1][3]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][3];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][3];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][3];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][3];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][3];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][3];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][3]/8==sfib_tot_ch[1][2]/8)&&sfib_tot_ch[0][3]>0&&sfib_tot_ch[1][2]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][3]][sfib_tot_ch[1][2]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][3];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][2];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][3];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][3];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][2];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][2];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][1]/8==sfib_tot_ch[1][4]/8)&&sfib_tot_ch[0][1]>0&&sfib_tot_ch[1][4]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][3]][sfib_tot_ch[1][4]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][1];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][4];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][1];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][1];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][4];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][4];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][2]/8==sfib_tot_ch[1][4]/8)&&sfib_tot_ch[0][2]>0&&sfib_tot_ch[1][4]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][2]][sfib_tot_ch[1][4]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][2];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][4];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][2];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][2];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][4];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][4];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][3]/8==sfib_tot_ch[1][4]/8)&&sfib_tot_ch[0][3]>0&&sfib_tot_ch[1][4]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][3]][sfib_tot_ch[1][4]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][3];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][4];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][3];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][3];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][4];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][4];
+      }
+    else sfib_multi==sfib_multi;
+    if((sfib_tot_ch[0][4]/8==sfib_tot_ch[1][3]/8)&&sfib_tot_ch[0][4]>0&&sfib_tot_ch[1][3]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][4]][sfib_tot_ch[1][3]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][4];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][3];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][4];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][4];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][3];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][3];
+      }
+    else sfib_multi==sfib_multi;
+     if((sfib_tot_ch[0][4]/8==sfib_tot_ch[1][1]/8)&&sfib_tot_ch[0][4]>0&&sfib_tot_ch[1][1]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][4]][sfib_tot_ch[1][1]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][4];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][1];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][4];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][4];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][1];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][1];
+      }
+    else sfib_multi==sfib_multi;
+      if((sfib_tot_ch[0][4]/8==sfib_tot_ch[1][2]/8)&&sfib_tot_ch[0][4]>0&&sfib_tot_ch[1][2]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][4]][sfib_tot_ch[1][2]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][4];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][2];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][4];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][4];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][2];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][2];
+      }
+    else sfib_multi==sfib_multi;
+      if((sfib_tot_ch[0][4]/8==sfib_tot_ch[1][4]/8)&&sfib_tot_ch[0][4]>0&&sfib_tot_ch[1][4]>0)
+      {
+	sfib_multi++;
+	sfib_fired[sfib_multi]=sfib_map[sfib_tot_ch[0][4]][sfib_tot_ch[1][4]];
+	sfib_tot_fired[0][sfib_fired[sfib_multi]]=sfib_tot_max[0][4];
+	sfib_tot_fired[1][sfib_fired[sfib_multi]]=sfib_tot_max[1][4];
+	sfib_multi_ch[0][sfib_multi]=sfib_tot_ch[0][4];
+	sfib_multi_tot[0][sfib_multi]=sfib_tot_max[0][4];
+	sfib_multi_ch[1][sfib_multi]=sfib_tot_ch[1][4];
+	sfib_multi_tot[1][sfib_multi]=sfib_tot_max[1][4];
+      }
+    else sfib_multi==sfib_multi;
+    
+   
+    
+    //cout << sfib_multi<<endl; //Top
+    //
+    //clustering analysis start from here
+    //
+    Int_t sfib_clus=0;
+    //
+    // (1) for multiplicity 1
+    //
+    /*    if(sfib_multi==1)
+      {
+	sfib_clus=1;
+	sfib_multi_clus_ch[0][1][1]=sfib_multi_ch[0][1];
+	sfib_multi_clus_tot[0][1][1]=sfib_multi_tot[0][1];
+	sfib_multi_clus_ch[1][1][1]=sfib_multi_ch[1][1];
+	sfib_multi_clus_tot[1][1][1]=sfib_multi_tot[1][1];
+	sfib_multi_clus_fired[1][1]=sfib_fired[1];
+	}
+    //cout << sfib_clus << endl;
+    //
+    */
+    // (2) for multiplicity 2
+    //
+    if(sfib_multi==2)
+      {
+	if((sfib_fired[1]-sfib_fired[2]==1)||(sfib_fired[2]-sfib_fired[1]==1)) sfib_clus=1;
+	else sfib_clus=2;
+      }
+    //
+    // (3) for multiplicity 3
+    //
+    if(sfib_multi==3)
+      {
+	if(abs(sfib_fired[1]-sfib_fired[2])==1)
+	  {
+	    if(abs(sfib_fired[1]-sfib_fired[3])==1||abs(sfib_fired[2]-sfib_fired[3])==1) sfib_clus=1;
+	    //condition 1-2-3, 3-1-2, 2-1-3, 3-2-1
+	    else sfib_clus=2;
+	  }
+	else if(abs(sfib_fired[1]-sfib_fired[3])==1)
+	  {
+	    if(abs(sfib_fired[2]-sfib_fired[3])==1) sfib_clus=1;
+	    //condition 1-3-2, 2-3-1
+	    else sfib_clus=2;
+	  }
+	else if(abs(sfib_fired[2]-sfib_fired[3])==1) sfib_clus=2;
+	else sfib_clus=3;
+      }
+    //
+    // (4) for multiplicity 4
+    //
+    /*   if(sfib_multi==4)
+      {
+	if(abs(sfib_fired[1]-sfib_fired[3])==1)
+	  {
+	    if(abs(sfib_fired[1]-sfib_fired[4])==1||abs(sfib_fired[2]-sfib_fired[4])==1||abs(sfib_fired[3]-sfib_fired[4])==1) sfib_clus=1;
+    */
+    
+    //cout << sfib_clus<<endl; //Top
+
+    fh_sfib_tot_ch_top1->Fill(sfib_tot_ch[0][1]);
+    fh_sfib_tot_max_top1->Fill(sfib_tot_max[0][1]);
+    fh_sfib_tot_ch_bot1->Fill(sfib_tot_ch[1][1]);
+    fh_sfib_tot_max_bot1->Fill(sfib_tot_max[1][1]);
+    fh_sfib_tot_ch_top2->Fill(sfib_tot_ch[0][2]);
+    fh_sfib_tot_max_top2->Fill(sfib_tot_max[0][2]);
+    fh_sfib_tot_ch_bot2->Fill(sfib_tot_ch[1][2]);
+    fh_sfib_tot_max_bot2->Fill(sfib_tot_max[1][2]);
+
+    fh_sfib_tot_ch_max_top1->Fill(sfib_tot_ch[0][1], sfib_tot_max[0][1]);
+    fh_sfib_tot_ch_max_top2->Fill(sfib_tot_ch[0][2], sfib_tot_max[0][2]);
+    fh_sfib_tot_ch_max_bot1->Fill(sfib_tot_ch[1][1], sfib_tot_max[1][1]);
+    fh_sfib_tot_ch_max_bot2->Fill(sfib_tot_ch[1][2], sfib_tot_max[1][2]);
+
+     fh_sfib_tot_ch_topbot1->Fill(sfib_tot_ch[0][1], sfib_tot_ch[1][1]);
+
+     fh_sfib_multi->Fill(sfib_multi);
+
+     fh_sfib_clus->Fill(sfib_clus);
+     fh_sfib_multi_clus->Fill(sfib_multi, sfib_clus);
+     fh_sfib_multi_ch_topbot1->Fill(sfib_multi_ch[0][1], sfib_multi_ch[1][1]);
+     fh_sfib_tot_top_multi1->Fill(sfib_multi_tot[0][1]);
+     fh_sfib_tot_top_multi2->Fill(sfib_multi_tot[0][2]);
+
+		
+    //2019.03.11 ASCII OUTPUT J.Tanaka
+    if(sfib_tot_max[0][1]>0||sfib_tot_max[0][1]>0)
+      {
+	//	cout << sfib_tot_max[0][1]<<" "<< sfib_tot_max[0][2]<<" "<< sfib_tot_max[0][3]<<endl; //Top
+	/*	std::ofstream run_max202("run_max202.txt",std::ios::app);
+	run_max202 << fNEvents<<" ";
+	run_max202 << sfib_tot_ch[0][1]<<" "; //Top 1st
+	run_max202 << sfib_tot_max[0][1]<<" "; //Top 1st
+	run_max202 << sfib_tot_ch[0][2]<<" "; //Top 2nd
+	run_max202 << sfib_tot_max[0][2]<<" "; //Top 2nd
+	run_max202 << sfib_tot_ch[0][3]<<" "; //Top 1st
+	run_max202 << sfib_tot_max[0][3]<<" "; //Top 1st
+	run_max202 << sfib_tot_ch[0][4]<<" "; //Top 2nd
+	run_max202 << sfib_tot_max[0][4]<<" "; //Top 2nd
+	run_max202 << sfib_tot_ch[0][5]<<" "; //Top 2nd
+	run_max202 << sfib_tot_max[0][5]<<" "; //Top 2nd
+	run_max202 << sfib_tot_ch[1][1]<<" "; //Bot 1st
+	run_max202 << sfib_tot_max[1][1]<<" "; //Bot 1st
+	run_max202 << sfib_tot_ch[1][2]<<" "; //Bot 2nd
+	run_max202 << sfib_tot_max[1][2]<<" "; //Bot 2nd
+	run_max202 << sfib_tot_ch[1][3]<<" "; //Bot 3rd
+	run_max202 << sfib_tot_max[1][3]<<" "; //Bot 3rd
+	run_max202 << sfib_tot_ch[1][4]<<" "; //Bot 4th
+	run_max202 << sfib_tot_max[1][4]<<" "; //Bot 4th
+	run_max202 << sfib_tot_ch[1][5]<<" "; //Bot 4th
+	run_max202 << sfib_tot_max[1][5]<<" "; //Bot 4th
+	run_max202<<std::endl; 
+	run_max202.close();*/
+      }
+  }
+  fNEvents += 1;
+}
+
+void R3BOnlineSpectra::FinishEvent()
+{
+   
+  for(Int_t det = 0; det < DET_MAX; det++) {
+    if(fMappedItems.at(det)) {
+      fMappedItems.at(det)->Clear(); 
+    }
+    if(fCalItems.at(det)) {
+      fCalItems.at(det)->Clear(); 
+    }
+    if(fHitItems.at(det)) {
+      fHitItems.at(det)->Clear(); 
+    }
+  }  	  
+}
+
+void R3BOnlineSpectra::FinishTask()
+{    
+  if(fMappedItems.at(DET_LOS)){
+    fh_los_channels->Write();
+    fh_los_tot->Write();
+    fh_los_dt_hits_ToT->Write();
+    fh_los_ihit_ToT->Write();
+  }
+ 
+ if(fMappedItems.at(DET_BMON)){ 
+    fhTpat->Write();
+  //  fh_spill_length->Write();
+    fhTrigger->Write();
+    fh_SEETRAM->Write();
+    fh_IC->Write();
+    fh_TOFDOR->Write();
+    
+}  
+  if(fCalItems.at(DET_TOFD))
+  {
+      for(Int_t i; i<4;i++){
+         fh_tofd_TotPm[i]->Write();
+      }
+  }    
+  for(Int_t ifibcount = 0; ifibcount < NOF_FIB_DET; ifibcount++) {	
+    if(fMappedItems.at(ifibcount + DET_FI_FIRST)) 
+    {
+      fh_channels_Fib[ifibcount]->Write();
+      fh_fibers_Fib[ifibcount]->Write();
+      fh_mult_Fib[ifibcount]->Write();
+      fh_time_Fib[ifibcount]->Write();
+      fh_multihit_m_Fib[ifibcount]->Write();   
+      fh_multihit_s_Fib[ifibcount]->Write();
+      fh_ToT_m_Fib[ifibcount]->Write();
+      fh_ToT_s_Fib[ifibcount]->Write();
+      fh_Fib_vs_Events[ifibcount]->Write();
+      fh_Fib_ToF[ifibcount]->Write();
+    }
+  
+  }   		
+  if(fMappedItems.at(DET_SFIB))
+  {
+    fh_sfib_Tot_top->Write();
+    fh_sfib_Tot_top1d->Write();
+    fh_sfib_Tot_top_g->Write();
+    fh_sfib_Tot_top1d_g->Write();
+    fh_sfib_Tot_bot->Write();
+    fh_sfib_Tot_bot1d->Write();
+    fh_sfib_Tot_bot_g->Write();
+    fh_sfib_Tot_bot1d_g->Write();
+    fh_sfib_channels->Write();
+    fh_sfib_channels_g->Write();
+    fh_sfib_tofd->Write();
+    fh_sfib_pspx->Write();
+    fh_sfib_tot_tvb->Write();
+    fh_sfib_fmult->Write();
+    fh_sfib_cmult->Write();
+    fh_sfib_fmult_g->Write();
+    fh_sfib_cmult_g->Write();
+    fh_sfib_tot_ch_top1->Write();
+    fh_sfib_tot_ch_top2->Write();
+    fh_sfib_tot_ch_bot1->Write();
+    fh_sfib_tot_ch_bot2->Write();
+    fh_sfib_tot_max_top1->Write();
+    fh_sfib_tot_max_top2->Write();
+    fh_sfib_tot_max_bot1->Write();
+    fh_sfib_tot_max_bot2->Write();
+    fh_sfib_tot_ch_max_top1->Write();
+    fh_sfib_tot_ch_max_top2->Write();
+    fh_sfib_tot_ch_max_bot1->Write();
+    fh_sfib_tot_ch_max_bot2->Write();
+    fh_sfib_tot_ch_topbot1->Write();
+    fh_sfib_multi->Write();
+    fh_sfib_clus->Write();
+    fh_sfib_multi_clus->Write();
+    fh_sfib_multi_ch_topbot1->Write();
+    fh_sfib_tot_top_multi1->Write();
+    fh_sfib_tot_top_multi2->Write();
+    fh_sfib_channels_top->Write();
+    fh_sfib_channels_bot->Write();
+    fh_sfib_channels_topvsbot->Write();
+
+  } 
+    if (fMappedItems.at(DET_PSPX))
+    {
+        // LOG(INFO) << "Finish MappedPspx" << FairLogger::endl;
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            fh_pspx_channel_x[i]->Write();
+            fh_pspx_channel_y[i]->Write();
+            fh_pspx_multiplicity_x[i]->Write();
+            fh_pspx_multiplicity_y[i]->Write();
+            fh_pspx_strips_position[i]->Write();
+        }
+    }
+    if (fCalItems.at(DET_PSPX))
+    {
+        for (UInt_t i = 0; i < N_PSPX; i++)
+        {
+            fh_pspx_cal_energy_frontback[i]->Write();
+        }
+    }
+    if (fHitItems.at(DET_PSPX))
+    {
+        for (UInt_t i = 0; i < (N_PSPX + 1) / 2; i++)
+        {
+            fh_pspx_hit_energy[i]->Write();
+            fh_pspx_hit_position[i]->Write();
+        }
+    }
+}
+
+ClassImp(R3BOnlineSpectra)
